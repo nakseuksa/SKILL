@@ -1,0 +1,70 @@
+{
+  "_comment": "虚构示例公司,数字仅用于演示脚本,不对应任何真实上市公司。",
+  "meta": {
+    "name": "示例零售集团(虚构)",
+    "ticker": "DEMO",
+    "as_of": "2026-06-30",
+    "route": "general",
+    "manufacturing": true,
+    "currency": "USD",
+    "unit": "百万美元(股本单位:百万股)",
+    "period_basis": "annual",
+    "eps_basis": "gaap",
+    "price": 12.0,
+    "eps_ttm": 1.05,
+    "forward_eps": 0.80,
+    "dps": 1.50,
+    "price_change_12m": -0.45,
+    "going_concern_doubt": false,
+    "sources": [
+      "示例:FY2026 年报 10-K(虚构)",
+      "示例:一致预期数据截至 2026-06-30(虚构)"
+    ]
+  },
+  "assumptions": {
+    "cost_of_equity": 0.10,
+    "growth": 0.01,
+    "tax_rate": 0.25
+  },
+  "periods": {
+    "t": {
+      "revenue": 9500, "cogs": 7030, "sga": 1900,
+      "net_income": 210, "income_cont_ops": 210,
+      "cfo": 420, "cfi": -380, "capex": 400, "depreciation": 350,
+      "ebit": 420, "interest_expense": 160,
+      "total_assets": 8200, "current_assets": 2600, "current_liabilities": 2300,
+      "cash": 300, "receivables": 520, "inventory": 1500, "other_current_assets": 280,
+      "ppe_net": 3900, "ppe_gross": 7800, "securities": 0,
+      "long_term_debt": 2400, "total_debt": 2700, "total_liabilities": 5600,
+      "retained_earnings": 1800, "book_equity": 2600,
+      "shares_outstanding": 200, "dividends_paid": 300,
+      "debt_due_18m": 700, "undrawn_credit": 400
+    },
+    "t1": {
+      "revenue": 10000, "cogs": 7200, "sga": 1950,
+      "net_income": 380, "cfo": 650, "cfi": -420, "capex": 450, "depreciation": 340,
+      "ebit": 640, "interest_expense": 140,
+      "total_assets": 8000, "current_assets": 2550, "current_liabilities": 2150,
+      "cash": 400, "receivables": 480, "inventory": 1400, "other_current_assets": 240,
+      "ppe_net": 3850, "ppe_gross": 7500, "securities": 0,
+      "long_term_debt": 2300, "total_debt": 2550, "total_liabilities": 5350,
+      "retained_earnings": 1890, "book_equity": 2650,
+      "shares_outstanding": 198, "dividends_paid": 300
+    },
+    "t2": {
+      "total_assets": 7900
+    }
+  },
+  "history": {
+    "eps": [2.20, 2.10, 2.00, 1.90, 1.05],
+    "revenue": [10800, 10500, 10300, 10000, 9500],
+    "roe": [0.14, 0.13, 0.12, 0.14, 0.08],
+    "roic": [0.11, 0.10, 0.09, 0.08, 0.06]
+  },
+  "signals": {
+    "estimates_trend": "down",
+    "above_200dma": false,
+    "insider_net_buy": false,
+    "catalyst": "无"
+  }
+}
