@@ -1,240 +1,273 @@
 ---
 name: agent-harness-dissector
-description: 以工程控制流与状态契约视角，机械、可验证地拆解本工作区（learnharness）的智能体运行时（Agent Harness）设计：包括无状态回合重建与角色分派缝（Prober/Teacher/Practitioner）、工具即控制流（Question Stopper / Authoring Retry / Submit-Agent）、分段系统提示词组装、叙述守卫与显式输出、以及后台任务 Live Steering 与 Idle Wake 双通道投递。每条结论必须先用 grep/read 取证并带 path:line 出处。
+description: 以工程控制流与状态契约视角，机械、可验证地拆解本工作区（learnharness）的智能体运行时（Agent Harness）：无状态回合重建与角色分派（prober / teacher / practice）、工具即控制流（terminate 与 finishTurn 两层终止、四类工具失败信道、Submit-Agent 收敛循环）、分段系统提示词组装与覆盖、send_to_user 输出通道门控、后台结果的 Live Steering 与 Idle Wake 双载具投递及 settleSteers 回收、BYOK 模型解析与计费过滤。每条结论必须先用 grep/read 取证并带 path:line 出处。Use when 阅读或修改 src/agent/**、src/server/chat-handler.ts、src/server/jobs.ts，新增 Agent 工具，调整角色行为、提示词片段或后台任务唤醒逻辑时。
 ---
 
 # SKILL: Agent Harness 与 LLM 工程模式拆解 (Agent Harness Dissector)
 
 ## 0. 目标与适用范围
 
-帮助读者**将工作区项目中的“智能体行为”还原为确定性的工程控制流、状态转换契约与消息投递管线**：任何一段关于 Agent 角色切换、工具调用、提示词拼装或后台子任务唤醒的描述，读者都能凭 `path:line` 跳到源码核对。
+把一切「AI 行为」翻译成：**Harness 用什么输入构造 Agent、暴露哪些工具 Schema、在哪个钩子拦截、在什么边界终止或重试、结果经哪个载具送回会话**。读者可凭 `path:line` 逐条核对。
 
 - 适用：
-  - 主会话 Agent（`prober` / `teacher` / `practice`）的无状态每回合构造与角色切换缝（Seam）。
-  - 工具即控制流（Tool-as-Control-Flow）：问题停止器（`makeQuestionStopper` / `finishTurn`）、参数治愈（`withArgumentHeal`）、内循环校验重试（`invalidInputResult`）、受控提交循环（`runSubmitAgent`）。
-  - 分段系统提示词（Segmented System Prompts）加载、排序、热覆盖与动态规则注入（`narrationGuard` / `SEND_TO_USER_DELIVERY_RULE`）。
-  - 后台子 Agent（researcher / pdf-reader / demo-builder / visual-maker / extractor / auditor）与主会话的双通道投递（Live Steering vs. Idle Wake）及未消费回收（`settleSteers`）。
-  - 模型解析链（`ModelRole` → `ResolvedModelSpec` → `PiEngine`）与 BYOK 拒绝门控。
+  - P1 每请求重建 Agent 与角色分派（`AgentKind = "prober" | "teacher" | "practice"`，`src/agent/teacher-agent.ts:56`）。
+  - P2 工具即控制流：`terminate`、`finishTurn`、工具失败信道、`runSubmitAgent`。
+  - P3 分段系统提示词：`composeInstructions`、`effectivePromptSegments`、语言指令。
+  - P4 显式输出通道：`send_to_user` 的挂载门控。
+  - P5 后台结果投递：注册表、两个载具、`settleSteers`。
+  - P6 模型解析链、拒绝门控与计费过滤。
 - 不适用：
-  - 纯前端 DOM/Canvas 布局渲染细节。
-  - 与 Agent 编排无关的纯文件 I/O 崩溃语义细节（交 `code-execution-trace`）。
+  - 纯前端渲染细节；消息在视图中的形态（交 `data-model-state-projection`）。
+  - 与编排无关的写盘崩溃语义（交 `code-execution-trace`）。
+  - Node 并发原语的 Java 对照（交 `java-to-ts-node-bridge`）。
 
-核心原则只有一条：**把“AI 决定做什么”徹底翻译成“Harness 用什么输入、暴露什么工具 Schema、靠什么 Hook 拦截、在什么边界终止或重试”。**
+核心原则：**把「AI 决定做什么」翻译成「Harness 在哪一行做了什么判断」。**
 
 ---
 
-## 1. 证据规则（最高优先级，先于一切格式要求）
+## 1. 证据规则（最高优先级）
 
-1. **先取证，后叙述。** 写出任何 Agent 工厂函数、工具名、TypeBox Schema、系统提示词片段文件、Hook 名之前，必须已经用 `grep` / `glob` / `read` 在本次会话中确认其存在。
-2. **出处格式统一为 `path:line`**（相对仓库根目录），在该标识符**首次出现**时附上。例：`makeQuestionStopper()`（`src/agent/teacher-agent.ts:157`）。
-3. **三级置信标记**，凡不是“读到代码原文”的内容都必须标注：
-   - 无标记 = 已读到代码原文，直接陈述。
-   - `【推断】` = 由已读代码的顺序/结构推出，但没有直接读到对应代码或测试（例：混合 toolCall 批次下某个钩子的触发顺序）。
-   - `【未验证】` = 没有读到相关代码（例：`@earendil-works/pi-agent-core` 包内部未展开的循环实现）。
-4. **禁止为满足格式而补写。** 模板中的某一项在当前 Agent 或工具中不存在时，写 `N/A — <原因>`，不得虚构重试轮数、门控开关或钩子。
-5. **签名与 Schema 照抄。** 函数签名、工具参数 Schema 常量名、返回对象字段以源码为准逐字抄写，不得凭记忆“简化”。
-6. **框架行为不凭记忆。** 涉及 Next.js 路由或模块实例行为时，按 `AGENTS.md` 要求先读 `node_modules/next/dist/docs/` 中对应文档；读不到则标 `【未验证】`。
+0. **锚点复核。** 开始前执行 `git rev-parse --short HEAD`；第 9 节行号仅对其标注的 commit 有效，引用前用 `grep -n` 按函数名重新定位。
+1. **先取证，后叙述。** Agent 工厂、工具名、Schema 常量、提示词片段、钩子名写出前必须本次会话 grep/read 过。
+2. **出处 `path:line`**，首次出现时附上。
+3. **三级置信**：无标记 / `【推断】` / `【未验证】`。
+4. **`pi-agent-core` 行为必须取证到 dist。** 循环语义（`terminate`、`finishTurn`、steering/follow-up 轮询、参数校验）以 `node_modules/@earendil-works/pi-agent-core/dist/agent-loop.js` 为准，并注明包版本（`package.json` 的 `version`）。只引用本仓库注释时标 `【未验证】`。
+5. **注释不是代码。** 注释与代码冲突时以代码为准并指出冲突（本仓库已知的例子见 6.5）。
+6. **禁止为满足格式而补写。** 不存在写 `N/A — <原因>`，不得虚构重试轮数、门控或钩子。
+7. **签名与 Schema 照抄。**
 
 ---
 
 ## 2. 表达规则
 
 ### 2.1 禁止
-- **拟人化心理描写**：「Prober 觉得已经摸清了学生的底细，决定移交给 Teacher」「Teacher 发现自己参数写错了，主动重试」。
-- **笼统的“调用大模型”**：「把历史对话发给 LLM 得到回复」。
-- **混淆“工具返回”与“用户作答”**：把 `questionResult()` 的内存占位返回说成“拿到了学生的回答”。
-- **未解释的自造术语**：任何不是代码标识符、也没有给出定义的名词。
+- 拟人化：「Prober 觉得摸清了学生底细」「Teacher 发现参数写错主动重试」。
+- 笼统的「调用大模型」。
+- 把 `questionResult()` 的内存占位说成「拿到了学生的回答」。
+- 把 `ProberAgent` / `TeacherAgent` / `PracticeAgent` 说成不同的类：它们是 `ReturnType<typeof create…Agent>` 类型别名（`teacher-agent.ts:362-365`），运行时都是同一个 `Agent` 类的实例，区别只在构造参数。
+- 未定义的自造术语。
 
-### 2.2 允许（并鼓励）
-- **代码中真实存在的 Harness 标识符**：如 `AgentKind`、`finishTurn`、`terminate: true`、`steeringMode: "all"`、`handOffEligible`、`settleSteers`、`narrationGuard`。首次出现时注明其定义位置与类型。
-- **开头 ≤3 行的总览**，概括所拆解的 Agent 工程模式。
-- **Mermaid 状态图/时序图**展示 Agent 循环边界、Tool 拦截点与 Steer 注入点。
+### 2.2 允许
+- 真实存在的 Harness 标识符：`AgentKind`、`finishTurn`、`terminate: true`、`steeringMode: "all"`、`handOffEligible`、`settleSteers`、`noteSteersDurable`、`registerLiveAgent`。
+- 开头 ≤3 行总览；Mermaid 时序图（参与者为真实文件/函数）。
 
-### 2.3 工具契约（Tool Contract）的标准六列写法
-凡拆解 Agent 挂载的工具，必须使用以下六列表格：
-
-| 工具名 (`name`) | 定义位置 (`path:line`) | 暴露门控条件 | 参数预处理与 Schema (`prepareArguments` / `parameters`) | 软失败返回值（内循环重试） | 成功返回值与 `terminate` 标志 |
+### 2.3 工具契约表（凡拆解工具必须使用）
+| 工具名 | 定义位置 | 暴露门控 | 参数预处理与 Schema | 失败信道与返回值 | 成功返回值与 `terminate` |
 |---|---|---|---|---|---|
-| 例：`quiz` | `src/agent/teacher-agent.ts:313` | `teacher` 角色常驻 | `withArgumentHeal` + `quizInputObject` | `invalidInputResult("quiz", problems)` (`isError: true`) | `questionResult()` (`details: null, terminate: true`) |
+
+「失败信道」必须写明属于 6.2 中的哪一类。
 
 ---
 
 ## 3. 工作流程
 
-1. **定位 Agent / 工具 / 投递入口**：`grep` 角色构造处（如 `src/server/chat-handler.ts`、`src/agent/teacher-agent.ts`）、工具定义处（`src/agent/tools.ts`、`src/agent/tools/*.ts`）或后台任务调度处（`src/agent/subagents/*.ts`、`src/server/jobs.ts`）。
-2. **识别所属工程模式（见第 4 节）**：确定目标属于 6 大 Agent Harness 模式中的哪一个或多个组合。
-3. **沿 Harness 装配链取证**：
-   - 查角色分派条件（Transcript Seam）。
-   - 查系统提示词拼装顺序与动态追加项。
-   - 查 `new Agent({...})` 的配置项（`initialState`、`finishTurn`、`steeringMode`、`convertToLlm`、`prepareRequest`）。
-   - 查工具 `execute` 内部的守卫、副作用（写盘 / `deliver` 入队）与返回结构。
-4. **套用 5 阶段拆解模板（第 5 节）**，并应用第 6 节专项规则。
-5. **补充测试佐证**：`grep` `tests/` 中使用假引擎（Fake `PiEngine`）或假工具注册表驱动该模式的测试（`tests/xxx.test.ts:line`）。
-6. **执行第 8 节自检清单**，修正后再输出。
+1. **锚点复核**，并记录 `pi-agent-core` 版本。
+2. **定位入口**：角色构造（`src/server/chat-handler.ts`、`src/agent/teacher-agent.ts`）、工具注册（`src/agent/tools.ts`、`src/agent/tools/*.ts`）、后台投递（`src/server/jobs.ts`、`src/agent/subagents/*.ts`）。
+3. **归入模式**（第 4 节）。
+4. **沿装配链取证**：
+   - 分派条件。
+   - 提示词组装顺序与追加项。
+   - `new Agent({...})` 配置（`initialState`、`finishTurn`、`steeringMode`、`convertToLlm`、`prepareRequest`），见 `teacher-agent.ts:213-275`。
+   - 工具 `execute` 内部守卫、副作用、返回结构。
+5. **套用 5 阶段模板**（第 5 节）与专项规则（第 6 节）。
+6. **补充测试佐证**：`grep tests/`（注入假 `PiEngine` 或 `buildAgent` 的测试）。
+7. **执行第 8 节自检。**
 
 ---
 
-## 4. 六大 Agent Harness 工程模式切分法则
+## 4. 六大工程模式
 
-拆解时必须指明目标机制对应的工程模式编号与边界：
-
-| 模式编号 | 模式名称 | 核心代码特征 | 关键工程机制 |
+| 模式 | 名称 | 代码特征 | 关键机制 |
 |---|---|---|---|
-| **P1** | **无状态回合重建与转录分派缝（Stateless Turn & Transcript Seam）** | `hasProbeDone(agentMessages)`、`record.kind === "practice"`、`new Agent(...)` | 服务端不驻留跨请求 Agent 状态；每次请求扫描 `ChatRecord.messages` 决定构造 `Prober`、`Teacher` 还是 `Practitioner`，回合结束即丢弃实例 |
-| **P2** | **工具即控制流（Tool-as-Control-Flow）** | `questionResult()`、`terminate: true`、`makeQuestionStopper`、`finishTurn`、`invalidInputResult`、`runSubmitAgent` | 工具不仅是外部查询，更是循环控制器：干净的问题提出强制终止整个 Agent 回合；结构/业务校验失败返回 `isError: true` 触发模型同回合自愈重试 |
-| **P3** | **分段提示词组装与热覆盖（Segmented Prompt Composition）** | `composeInstructions`、`effectivePromptSegments`、`promptSwitches` | 按确定性规则拼装共享基座、角色专属数字前缀片段与共享附录，支持按设置开关在每回合动态替换本地覆盖片段 |
-| **P4** | **叙述守卫与显式输出通道（Narration Guard & Explicit Delivery）** | `narrationGuardApplies`、`makeNarrationGuard`、`sendToUserTool` (`send_to_user`) | 当启用守卫时，要求模型通过显式工具输出面向学习者的正文，拦截“只有推理思考没有面向用户输出就直接发问”的静默跳跃 |
-| **P5** | **双通道异步投递与回收（Live Steering vs. Idle Wake）** | `deliverJobResult`、`handOffEligible`、`agent.steer`、`pump`、`waitForIdle`、`settleSteers` | 后台任务完成 ≠ 会话投递；有活跃回合时走 `agent.steer` 在原生回合边界注入（`probe-handoff` 除外），死回合未消费的 Steer 在结算时回收并转入 Idle Wake 新建服务端回合 |
-| **P6** | **模型解析链与计费门控（BYOK Resolution & Money Channel）** | `piEngineFor`、`resolveConversationSpec`、`onUsage`、`usageWasAdmitted` | 角色覆盖 → 模型槽（`strong`/`cheap`/`vision`）→ 未配置则显式拒绝；仅非 `aborted` 且通过准入的模型响应才记入账本 |
+| **P1** | 无状态回合与分派 | `hasProbeDone(agentMessages)`、`record.kind === "practice"`、`buildAgent` | 每次请求从 `ChatRecord.messages` 重建 Agent，回合结束丢弃（注释 `teacher-agent.ts:30-36`） |
+| **P2** | 工具即控制流 | `questionResult()`、`terminate: true`、`makeQuestionStopper`、`finishTurn`、`invalidInputResult`、`runSubmitAgent` | 问题干净提出即结束回合；工具失败以 `isError: true` 回给模型重试 |
+| **P3** | 分段提示词组装 | `composeInstructions`、`effectivePromptSegments`、`promptSwitches`、`LANGUAGE_PROMPT_DIRECTIVES` | 基座 → 角色片段 → shared 附录；开关打开且覆盖文件存在时替换；每回合按需重组 |
+| **P4** | 显式输出通道 | `sendToUserTool`、`withArgumentHeal(sendToUserTool)` | 仅在未注入测试工具表且模型为 Claude 系时额外挂载 |
+| **P5** | 双载具投递与回收 | `deliverJobResult`、`pump`、`handOffEligible`、`waitForIdle`、`settleSteers`、`noteSteersDurable` | 一个注册表，两个载具；只有持久化记录中出现 steer ID 才算投递完成 |
+| **P6** | 模型解析与计费过滤 | `resolveConversationSpec`、`piEngineForSpec`、`piEngineFor`、`onUsage`、`usageWasAdmitted` | 未配置模型或缺少 key 时在回合开始前返回 503；中止的响应不计费 |
 
 ---
 
-## 5. 单机制 5 阶段拆解模板
+## 5. 单机制 5 阶段模板
 
-每个 Agent 角色或 Harness 机制按顺序展开以下 5 个阶段。**不存在的阶段写 `N/A — <原因>`。**
+不存在的阶段写 `N/A — <原因>`。
 
-### 阶段一：构造入口、分派缝（Seam）与引擎绑定
-- 构造工厂函数 `path:line`，以及调用方（如 `chat-handler.ts`）进入该分支的**精确布尔判定表达式**。
-- 绑定的 `AgentKind` / `ModelRole`、模型解析入口及传入 `new Agent({...})` 的初始消息来源。
+### 阶段一：构造入口、分派条件与引擎
+- 工厂 `path:line`；调用方进入该分支的布尔表达式原文。
+- `AgentKind`、引擎来源（`piEngineForSpec` 调用行）、初始消息来源。
 
-### 阶段二：系统提示词拓扑与 `convertToLlm` 转换缝
-- 提示词组装函数 `path:line`、静态缓存 vs. 按回合动态组装的触发条件（如 `opts.promptSwitches`）、以及基于模型/工具状态动态拼接的尾部规则（如 `SEND_TO_USER_DELIVERY_RULE`）。
-- 挂载到 `convertToLlm` 的函数名与 `prepareRequest` 中的请求级标记逻辑（如 `callPurpose.background` 判定）。
+### 阶段二：提示词与消息转换
+- 组装函数、缓存条件、追加项（语言指令等）。
+- `convertToLlm` 挂载的函数（规则细节交 `data-model-state-projection`）；`prepareRequest` 中的请求级逻辑。
 
-### 阶段三：工具注册表、门控与参数治愈/校验契约
-- 填写 **第 2.3 节工具契约标准六列表格**。
-- 说明工具如何通过闭包捕获存储端口（`ChatStore` / `JobStore` / `GraphStore`）与投递回调（`deliver` / `spawn`）。
+### 阶段三：工具注册表与契约
+- 第 2.3 节表格；工具如何通过闭包获得存储端口与回调（`deliver` / `spawn`）。
 
-### 阶段四：循环控制钩子与跨回合状态跃迁
-- `finishTurn`（停止器）、`narrationGuard`、`steeringMode` 的具体配置值与触发条件。
-- 工具执行引发的跨回合副作用：如写入计划树（`saveTree`）、入队唤醒信号（`deliverJobResult`）、或留置悬空未答工具调用等待客户端下次请求。
+### 阶段四：循环控制与跨回合状态
+- `finishTurn`、`terminate`、`steeringMode` 的配置值与触发条件，引用 `agent-loop.js` 行号。
+- 跨回合副作用：写盘、入队投递、留下悬空调用等待下一次请求。
 
-### 阶段五：结算、计费过滤与未消费 Steer 回收
-- `agent.subscribe` 中 `onUsage` 的过滤条件（`stopReason === "aborted"` 等早退分支 `path:line`）。
-- 回合结束时，已交接但未注入的 Steer（如被 Question Stopper 提前截断）如何经 `settleSteers` 归还队列并重新触发 `pump`。
+### 阶段五：结算、计费与回收
+- `onUsage` 过滤条件。
+- 回合结束时 `unregisterLiveAgent` → `settleSteers` 的顺序与未注入 steer 的回收。
 
 ---
 
 ## 6. 专项规则
 
-### 6.1 区分两层终止机制：`terminate: true` vs. `finishTurn` 停止器
-拆解问题类工具（`quiz` / `ask_user_question` / `problem`）时，必须同时交代两层防线（`src/agent/teacher-agent.ts:136-177`、`src/agent/tool-execute.ts:214-233`）：
-1. **单工具批次原生终止**：`questionResult()` 和 `problemResult()` 返回 `{ content: [...], details: null, terminate: true }`（`tool-execute.ts:222-250`）。当模型单次消息只调用了该工具时，`pi-agent-core` 原生检测到批次内所有结果均带 `terminate: true` 即结束循环。
-2. **混合批次兜底终止（`makeQuestionStopper`）**：若模型在同一条 assistant 消息里同时发出了普通工具调用（如 `send_to_user` / `read`）和问题工具调用，`terminate: true` 的“全批次终止”条件不满足；此时 `finishTurn: (turn) => (stopper(turn) ? { action: "end" } : undefined)`（`teacher-agent.ts:227`）在所有工具结果挂载后、下一轮 `agent.steer` 轮询**之前**强制返回 `{ action: "end" }` 退出循环。
-3. **失败不终止**：若问题工具校验失败（`result.isError === true`），`makeQuestionStopper` 返回 `false`（`:172-174`），循环继续，让模型在同一回合内重试。
+### 6.1 两层终止：`terminate: true` 与 `finishTurn`（依据 `pi-agent-core` 1.4.0）
+1. **批次终止**：`shouldTerminateToolBatch()` 要求批次内**全部**结果 `terminate === true`（`agent-loop.js:471-473`）；结果为真时 `hasMoreToolCalls = false`（`:172`），即不再为了工具结果发起下一次模型调用。
+2. **`terminate` 不是硬停止**：之后循环仍会轮询 steering 队列，有待注入消息就继续（`:191-194`）；内层循环退出后还会检查 follow-up 队列（`:197-203`）。
+3. **`finishTurn` 才是硬停止**：它在工具结果挂上之后、`turn_end` 之前调用（`:184-185`）；返回 `{ action: "end" }` 时立即 `agent_end` 并返回（`:186-189`），**早于** steering 轮询。本仓库配置为 `finishTurn: (turn) => (stopper(turn) ? { action: "end" } : undefined)`（`teacher-agent.ts:241`）。
+4. **`makeQuestionStopper`**（`teacher-agent.ts:169-193`）：本条消息含问题工具（`QUESTION_TOOLS`，`src/core/pending.ts:53-59`：`quiz`、`probe`、`ask_user_question`、`explain`、`recall`；`practice` 角色另加 `PRACTICE_PROBLEM_TOOL`）调用，且这些调用的结果没有一个 `isError` → 返回 `true`。任一失败 → `false`，循环继续让模型重试。
+5. **小结**：`terminate` 处理「只有问题工具」的批次；`finishTurn` 处理「问题工具与其他工具混在一起」的批次，并阻止已排队的 steer 在提问后被注入。
+6. 生成失败（`stopReason` 为 `error` / `aborted`）时循环在 `:148-159` 直接结束，`finishTurn` 被调用但返回值不被使用（`:155`）。
 
-### 6.2 拆解 Steer 投递：必须区分「注册表（Registry）」与「载具（Vehicle）」
-拆解 `src/server/jobs.ts` 时，必须写清：
-- **唯一权威注册表**：`globalThis` 上的 `WakeState.queues: Map<string, QueuedSteer[]>`（`src/server/jobs.ts:111`）。
-- **两个投递载具**：
-  1. **Vehicle 1（Live Run `agent.steer`）**：仅当 `live && isTurnRunning(chatId)`（`:513`）且 `entry.steer.customType !== "probe-handoff"`（`:265`）时，调用 `agent.steer(entry.steer)` 并标记 `entry.handedTo = agent`（`:266-267`）。
-  2. **Vehicle 2（Idle Wake `s.turnRunner`）**：等待 `waitForIdle(chatId)`（`:535`）后重读最新 `ChatRecord`（`:540`），确认无用户搁置（`!endsInDismissal` 且 `!endsInQuestionRecovery`，`:569`），再将所有待投递 `steers` 作为一次服务端回合的输入调用 `s.turnRunner(chatId, { type: "steers", steers })`（`:582`）。
+### 6.2 四类工具失败信道（必须区分）
+| 信道 | 触发位置 | 结果形态 | 是否触发 stopper 的「失败不停」分支 |
+|---|---|---|---|
+| A. 循环层校验失败 | 工具不存在（`agent-loop.js:489-495`）；`prepareArguments` 或 `validateToolArguments` 抛错（`:496-498` → `:539-545`）；`stopReason === "length"` 时整批失败（`:168-169`） | `isError: true`，文本为错误消息 | 是 |
+| B. 工具内细化校验失败 | `invalidInputResult(toolName, problems)`（`src/agent/tool-execute.ts:118-133`），如 `teachQuizToolFor` 的 nodeId 校验（`src/agent/tools.ts:383-389`） | `isError: true`，`details: { tool, problems }`；`agent-loop.js:588` 按 `result.isError === true` 识别 | 是 |
+| C. 业务守卫拒绝 | `serverExecute()` 包装的工具返回 `{ ok: false, error }` 对象（`tool-execute.ts:198-227` → `toToolResult()` `:164-182`） | **`isError` 不置位**；`content` 是 JSON 文本，`details` 是原对象 | 否（问题工具不走 `serverExecute`，见注释 `tool-execute.ts:194-196`） |
+| D. 执行抛异常 | `execute` 抛出（`serverExecute` 重新抛出，`tool-execute.ts:222-225`） | 循环转为 `isError: true`（`agent-loop.js:590-598`） | 是 |
+
+- 参数预处理：所有注册表都经 `healToolRecord()`（`src/agent/tools/heal.ts:46-48`）包装，`withArgumentHeal()`（`:34-40`）在 TypeBox 校验**之前**先运行工具自带的 `prepareArguments`，再运行 `healEncodedArguments`。
+- `runSubmitAgent()`（`src/agent/subagents/submit-agent.ts:48`）：校验函数返回问题字符串时走信道 B（`:103`），默认 `maxTurns ?? 4`（`:114`）。
+
+### 6.3 Steer 投递：注册表（Registry）与载具（Vehicle）
+- **注册表**：`globalThis.__lhWakePipeline`（`src/server/jobs.ts:131-138`）上的 `WakeState.queues: Map<string, QueuedSteer[]>`（`:106-112`）；学习者插话另有 `userSteers`（`:118`）。
+- **入队**：`deliverJobResult(steer)`（`:223-229`）同步入队（按 `steer.id` 去重，`queueSteer()` `:231-244`），`void pump(chatId)` 后立即返回 Promise。
+- **载具 1：活跃回合的 `agent.steer`**。
+  - `registerLiveAgent()`（`:295-303`）在 `runPiTurn` **之前**调用（`chat-handler.ts:568`），并立即 `handOffEligible()`。
+  - `handOffEligible()`（`:260-287`）：先要求 `automaticFollowUpAllowed(chatId, agent)`（`:254-258`，订阅类连接的后台同意门控）；对 `!entry.waking && !entry.deferred && entry.handedTo !== agent && entry.steer.customType !== "probe-handoff"` 的条目调用 `agent.steer()`（`:267-271`）。
+  - 注入时机由 `pi-agent-core` 决定：运行开始时轮询一次（`agent-loop.js:90`），每个回合结束后轮询（`:191`），轮询结果在下一次模型调用前作为 `message_start` / `message_end` 写入上下文（`:121-126`）；`steeringMode: "all"`（`teacher-agent.ts:249`）一次注入全部。
+- **载具 2：Idle Wake**。`pump()`（`:479-622`）在无可交给活跃回合的条目时 `await waitForIdle(chatId)`（`:540`）。`waitForIdle()`（`:703-721`）每 `POLL_MS`（400ms，`:150`）轮询，要求 `!isTurnRunning(chatId) && !hasUnresolvedQuestion(record.messages)`，满足后再等 `GRACE_MS`（750ms，`:165`）复查。随后重读记录（`:545`），检查 `endsInDismissal || endsInQuestionRecovery || !automaticFollowUpAllowed(chatId)`，任一为真则暂停（`:574-577`）；否则 `s.turnRunner(chatId, { type: "steers", steers })`（`:588`）。
+- **pump 中活跃回合分支的三种走向**（`:517-535`）：
+  - `handable.length > 0 && !handoffWaits` → `return`，由运行中的回合交付。
+  - `handable.length > 0 && handoffWaits` → `delay(POLL_MS)` + `waitForIdle` 后 `continue` 重新循环。
+  - `handable.length === 0` → 落到下方 Idle Wake 路径。
+- **回收**：回合结算时 `unregisterLiveAgent()`（`:348-352`）**必须先于** `settleSteers()`（`:381-406`），见 `chat-handler.ts:679-680`（失败路径 `:605, :611`）。`settleSteers` 对已出现在持久化消息中的条目 resolve，其余清除 `handedTo` 后重新 `pump`。
+
+### 6.4 「入队」不等于「投递完成」
+- `deliverJobResult` 返回或 Idle Wake 的 HTTP 200 都不是投递确认（注释 `jobs.ts:609-610`）。
+- 投递完成 = 持久化消息中出现该 steer 的 ID：`noteSteersDurable()`（`:183-190`）或 `settleSteers()` 的 ID 比对。
+- `steerDelivered(messages, steerId)`（`src/core/contracts/jobs.ts:435-437`，`messages.some(m => m.id === steerId)`）用于过滤唤醒输入中已落盘的 steer（`chat-handler.ts:337`）与恢复流程（`jobs.ts:691`）。
+- 例外：无 jobId 的 `probe-handoff` 在唤醒返回 200 时直接 `completeEntry()`（`jobs.ts:603-605`）。
+
+### 6.5 已知的注释与代码冲突
+- `teacher-agent.ts:63-66` 注释称顺序为「基座 → shared → 角色片段」；实际 `listSourceSegments()`（`src/agent/prompt-segments.ts:62-97`）是「基座 → 角色片段 → shared」，与 `teacher-agent.ts:41-47` 和 `prompt-segments.ts:16-19` 一致。
+- `jobs.ts:473-477` 注释称活跃回合经 `agent.followUp` 交付；实际代码调用 `agent.steer()`（`:269`）。
+- `prompt-segments.ts:86` 注释称 practice 的 shared 白名单只有格式指南；实际 `PRACTICE_SHARED_FRAGMENTS`（`:43`）有 4 个文件。
 
 ---
 
 ## 7. 负面约束
 
-1. **严禁把 `probe_done` 当成在同一个 Agent 实例里切换 Prompt。** `probe_done` 绝不修改当前正在运行的 `ProberAgent`；它是将成功结果写入转录并入队 `probe-handoff` Steer，等 `ProberAgent` 回合彻底结束后，由 Idle Wake（或下次客户端请求）扫描到 `hasProbeDone(agentMessages) === true` 从而**新建 `TeacherAgent` 实例**。
-2. **路径不可悬空。** 任何标识符首次出现都带 `path:line`。
-3. **严禁混淆“入队成功”与“投递完成”。** `deliverJobResult` 入队或 HTTP 返回 200 都不是投递确认；唯有 `steerDelivered(messages, steerId)`（`src/core/contracts/jobs.ts:446`）在持久化 `ChatRecord.messages` 中扫到对应 `steer.id` 才算投递落地（`src/server/jobs.ts:501,556,587`）。
-4. **不得为填模板而编造。** 不存在就写 `N/A`，不确定就标 `【推断】` 或 `【未验证】`。
+1. **严禁把 `probe_done` 当成在同一个 Agent 实例中切换提示词。** 它只把调用与结果留在本回合消息里，并入队 `probe-handoff`；下一次构造 Agent 时 `hasProbeDone()` 为真才构造 teacher。
+2. **严禁混淆「入队成功」与「投递完成」**（6.4）。
+3. **严禁把 `terminate: true` 说成「结束回合」**（6.1 第 2 点）。
+4. **严禁把 `{ ok: false }` 业务拒绝说成 `isError`**（6.2 信道 C）。
+5. **路径不可悬空；不得为填模板编造。**
 
 ---
 
 ## 8. 输出前自检清单
 
-- [ ] 每个函数、工具、常量、文件都在本次会话中 `grep` / `read` 过，且首次出现带 `path:line`。
-- [ ] 已明确标注目标所属的工程模式编号（P1~P6）。
-- [ ] 工具拆解已包含第 2.3 节的六列标准表格（含软失败 `invalidInputResult` 与成功返回值的对比）。
-- [ ] 若涉及问题工具，已同时说明 `terminate: true` 与 `makeQuestionStopper`（`finishTurn`）的配合关系及校验失败不停止的逻辑。
-- [ ] 若涉及后台投递或阶段交接，已区分 Registry（`queues`）与 Vehicle（`agent.steer` vs. `turnRunner`）。
-- [ ] 没有拟人化表达，推断和未验证内容已标 `【推断】` / `【未验证】`。
+- [ ] 已记录 HEAD 与 `pi-agent-core` 版本；标识符首次出现带 `path:line`。
+- [ ] 已标注模式编号（P1~P6）。
+- [ ] 工具表已写明失败信道类别（A/B/C/D）。
+- [ ] 问题工具：已说明 `terminate` 与 `finishTurn` 的分工（引用 `agent-loop.js` 行号）。
+- [ ] 后台投递：已区分注册表与两个载具，并写明 pump 的分支走向与暂停条件。
+- [ ] 回收：已写明 `unregisterLiveAgent` → `settleSteers` 顺序。
+- [ ] 没有拟人化表达；注释支撑的结论已标明。
 
 ---
 
-## 9. 示范案例：Prober → Teacher 阶段交接（`probe_done` 工具 + `probe-handoff` 唤醒 + 转录缝重建）
+## 9. 示范案例：Prober → Teacher 交接（`probe_done` + `probe-handoff` + Idle Wake）
 
-> 以下行号于 2026-11-09 对照代码核对。使用本案例前**必须重新核对**；代码与本文不一致时以代码为准。
+> 行号基于 commit `8b235af`（2026-11-06），`@earendil-works/pi-agent-core` 1.4.0。按第 1 节第 0条复核后使用；代码与本文不一致时以代码为准。
 
-**总览**：拆解教学会话如何从探测阶段（`ProberAgent`）无人工干预地平滑切换到规划/教学阶段（`TeacherAgent`）。涵盖工程模式：**P1 无状态转录分派缝 + P2 工具即控制流 + P5 Idle Wake 异步投递**。
+**总览**：prober 调用 `probe_done` 后，其结果随回合 1 落盘；同时入队的 `probe-handoff` 不进入运行中的 prober，而是等回合 1 结束后由 Idle Wake 发起回合 2，此时 `hasProbeDone()` 为真，构造 teacher（模式 **P1 + P2 + P5**）。
 
 ```mermaid
 sequenceDiagram
-    participant Handler as chat-handler.ts
-    participant Prober as ProberAgent (回合 1)
-    participant Tool as probe_done (probe.ts)
-    participant Jobs as jobs.ts (Wake Pipeline)
-    participant Teacher as TeacherAgent (回合 2, Idle Wake)
+    participant H as chat-handler.ts
+    participant P as Agent(kind=prober) 回合1
+    participant T as probe_done.execute (probe.ts)
+    participant J as jobs.ts pump
+    participant W as Agent(kind=teacher) 回合2
 
-    Handler->>Handler: hasProbeDone(agentMessages) === false (chat-handler.ts:418)
-    Handler->>Prober: createProberAgent (chat-handler.ts:508)
-    Prober->>Tool: toolCall: probe_done(input)
-    Tool->>Tool: 守卫：!hasUnresolvedQuestion && !probeConcluded (probe.ts:69,77)
-    Tool->>Jobs: ctx.deliver(buildProbeHandoffSteer(chatId)) (probe.ts:81)
-    Jobs->>Jobs: 入队 queues；因 customType === "probe-handoff"，跳过 Live Run (jobs.ts:265,519)
-    Jobs->>Jobs: await waitForIdle(chatId) (:527/:535) 等待 Prober 回合结算
-    Tool-->>Prober: return { text: PROBE_DONE_ACK_TEXT, details: { ok: true } } (:92-95)
-    Prober-->>Handler: Prober 输出结语并结束回合 1，持久化 probe_done 调用与结果并 endTurn
-    Jobs->>Handler: waitForIdle 放行 -> turnRunner(chatId, { type: "steers", steers: [handoff] }) (jobs.ts:582)
-    Handler->>Handler: 写入 steer_probe_<chatId>；hasProbeDone(agentMessages) === true (:418)
-    Handler->>Teacher: createTeacherAgent (chat-handler.ts:496) 启动规划回合
+    H->>H: teaching = hasProbeDone(agentMessages) → false（:429）
+    H->>P: createProberAgent(...)（:532-549）
+    H->>J: registerLiveAgent(chatId, P)（:568）
+    P->>T: toolCall probe_done
+    T->>T: 守卫：getChat / hasUnresolvedQuestion / probeConcluded（probe.ts:66-79）
+    T->>J: ctx.deliver(buildProbeHandoffSteer(chatId))（probe.ts:81）
+    Note over J: deliverJobResult 同步入队并 void pump，立即返回
+    T-->>P: { text: PROBE_DONE_ACK_TEXT, details: { ok: true } }（probe.ts:92-95）
+    J->>J: handOffEligible 跳过 probe-handoff（jobs.ts:267）
+    J->>J: handable 为空 → await waitForIdle（:540）
+    P->>P: 无 terminate → 再调用一次模型输出结语 → 无工具调用，循环结束
+    H->>H: persistTurn 落盘 probe_done 调用与结果；unregisterLiveAgent → settleSteers（:679-680）
+    J->>J: waitForIdle 放行（含 750ms 复查）
+    J->>H: turnRunner(chatId, { type: "steers", steers: [handoff] })（jobs.ts:588）
+    H->>H: appends = 未落盘的 steers（:337）；teaching = hasProbeDone → true（:429）
+    H->>W: createTeacherAgent(...)（:519-531）
+    J->>J: status 200 且无 jobId → completeEntry（jobs.ts:603-605）
 ```
 
-### 阶段一：构造入口、分派缝（Seam）与引擎绑定
+### 阶段一：构造入口、分派条件与引擎
 
-1. **分派缝判定（`src/server/chat-handler.ts:418,469-525`）**：
-   - 在每个回合请求处理中，`handleChatRequest` 调用 `const teaching = hasProbeDone(agentMessages)`（`src/server/chat-handler.ts:418`）。
-   - `hasProbeDone(messages: readonly LhMessage[]): boolean`（`src/core/native-messages.ts:782`）扫描消息列表，通过 `probeDoneResultIds(messages)`（`:760`）查找是否存在已成功结算的 `probe_done` 工具调用。
-   - 角色构造三元分支（`src/server/chat-handler.ts:469-525`）：
-     - `record.kind === "practice"` → `createPracticeAgent(...)`（`:472`，定义于 `src/agent/teacher-agent.ts:344`）。
-     - `teaching === true` → `createTeacherAgent(...)`（`:496`，定义于 `src/agent/teacher-agent.ts:293`）。
-     - `teaching === false` → `createProberAgent(...)`（`:508`，定义于 `src/agent/teacher-agent.ts:283`）。
-2. **引擎绑定**：
-   - 无论 `ProberAgent` 还是 `TeacherAgent`，在 `chat-handler.ts` 中均共享上方解析出的同一个 `conversationEngine`（`src/server/chat-handler.ts:423,450`）；若在未传入 `opts.engine` 的裸调用场景下，`baseAgentOptions` 回退调用 `piEngineFor(kind as "prober" | "teacher")`（`src/agent/teacher-agent.ts:184`）。
+1. **分派**（`src/server/chat-handler.ts:429, 480, 493-549`）：
+   - `const teaching = hasProbeDone(agentMessages);`（`:429`）
+   - `hasProbeDone(messages)`（`src/core/native-messages.ts:782-784`）即 `probeDoneResultIds(messages).size > 0`。`probeDoneResultIds()`（`:760-778`）要求：`probe_done` 调用所在 assistant 消息的 `stopReason` 不是 `error` / `aborted`；存在 `toolName === "probe_done"`、`toolCallId` 匹配、`!isError`、且 `details.ok !== false` 的结果。
+   - 构造表达式（`:493-549`）：`buildAgent` 存在时走测试注入（`:494`）；否则 `record.kind === "practice"` → `createPracticeAgent`（`:496`）；`teaching` → `createTeacherAgent`（`:520`）；否则 `createProberAgent`（`:532`）。
+2. **引擎**：
+   - 三个角色共用 `conversationEngine = piEngineForSpec(conversation, () => callPurpose.background, lifecycle, retentionForSlot("strong"))`（`chat-handler.ts:291-293`），其中 `conversation = resolveConversationSpec(record.settings, effective.models.strong)`（`:247`）。
+   - `baseAgentOptions` 中的 `opts.engine ?? piEngineFor(...)`（`teacher-agent.ts:200`）不是回退模型：`piEngineFor()`（`src/agent/models.ts:194-198`）无条件抛错，注释（`:188-193`）称到达此处即为装配错误。
 
-### 阶段二：系统提示词拓扑与 `convertToLlm` 转换缝
+### 阶段二：提示词与消息转换
 
-1. **系统提示词切换（`src/agent/teacher-agent.ts:77-94,187-190`）**：
-   - `createProberAgent` 传入 `kind = "prober"`；`createTeacherAgent` 传入 `kind = "teacher"`。
-   - `composeInstructions(kind, switches)`（`src/agent/teacher-agent.ts:77`）调用 `effectivePromptSegments(kind, switches ?? {})`（`src/agent/prompt-segments.ts`），将各片段以 `"\n\n---\n\n"` 拼接（`:83`）。
-   - 当 `narrationGuardApplies(kind, engine.model, opts.tools !== undefined)`（`:186`）为真时，在系统提示词末尾追加 `SEND_TO_USER_DELIVERY_RULE`（`:190`）。
-2. **`convertToLlm` 转换缝（`src/agent/teacher-agent.ts:242`）**：
-   - 挂载 `convertToLlm: toLlmMessages`（`src/core/native-messages.ts:583`）。
-   - 当回合 2（`TeacherAgent`）启动时，记录中的 `probe-handoff` Marker（`role: "custom", customType: "probe-handoff"`）在 `toLlmMessages` 的 `src/core/native-messages.ts:625-639` 分支中被转换为一条标准模型可见的 `{ role: "user", content: [{ type: "text", text: marker.content }], timestamp: marker.timestamp }`，其中 `marker.content` 为常量 `HANDOFF_TEXT`（`src/core/contracts/chat.ts:189`）。
+1. **组装**：
+   - `composeInstructions(kind, switches)`（`teacher-agent.ts:79-86`）→ `effectivePromptSegments(kind, switches ?? {})`（`src/agent/prompt-segments.ts:105-125`），开关为真且覆盖文件存在时用覆盖文本，片段 `trim` 后以 `"\n\n---\n\n"` 连接。
+   - 顺序（`listSourceSegments()`，`prompt-segments.ts:67-97`）：`system-prompt.md` → `prompts/<kind>/` 下数字前缀片段（排序）→ `prompts/shared/` 片段。`practice` 不含基座，shared 只取白名单 `PRACTICE_SHARED_FRAGMENTS`（`:43`）。
+   - 缓存：无 `promptSwitches` 时使用模块加载时的缓存 `composedInstructions[kind]`（`teacher-agent.ts:92-96`）；有则每回合重组（`:202-204`）。chat-handler 总是传入 `promptSwitches`（`chat-handler.ts:470`）。
+   - 追加：`opts.language` 命中时追加 `LANGUAGE_PROMPT_DIRECTIVES[opts.language]`（`teacher-agent.ts:205-207`，定义 `:139-145`）。
+2. **转换**：`convertToLlm: toLlmMessages`（`teacher-agent.ts:256`）。回合 2 中 `probe-handoff` Marker 被展平为 user 文本，内容为 `HANDOFF_TEXT`（`src/core/contracts/chat.ts:187`）；完整规则见 `data-model-state-projection` 第 6.3 节。
+3. **`prepareRequest`**（`teacher-agent.ts:257-274`）：遍历本次请求的消息，按 `nativeInputCause()` 判断是否存在新的自动输入（`probe-handoff` 属于 `"automatic"`，`native-messages.ts:848`），据此设置 `opts.callPurpose.background`。
 
-### 阶段三：工具注册表、门控与参数治愈/校验契约
+### 阶段三：工具注册表与契约
 
-`ProberAgent` 通过 `createProberTools(ctx, opts.toolToggles)`（`src/agent/tools.ts`）装配工具，其中核心交接工具为 `probeDoneTool(ctx)`（`src/agent/tools/probe.ts:49`）：
+prober 注册表由 `createProberTools(ctx, opts.toolToggles)`（`src/agent/tools.ts:287-348`）组装：问题工具 `probe`（或自由回忆模式下的 `recall`，`:312-313`）、`ask_user_question`、`read` / `ls` / `find` / `grep`、`research`（如可用）/ `pdf`、可选图谱读取工具，以及 `probe_done`。`probe_done` 在开关过滤**之后**再次加入（`:346`），因此无法被设置关闭（注释 `:291-292`）。
 
-| 工具名 (`name`) | 定义位置 (`path:line`) | 暴露门控条件 | 参数预处理与 Schema (`prepareArguments` / `parameters`) | 软失败返回值（内循环重试） | 成功返回值与 `terminate` 标志 |
+| 工具名 | 定义位置 | 暴露门控 | 参数预处理与 Schema | 失败信道与返回值 | 成功返回值与 `terminate` |
 |---|---|---|---|---|---|
-| `probe_done` | `src/agent/tools/probe.ts:51` | 仅 `prober` 角色挂载（`teacher` 与 `practice` 无此工具） | ` healToolRecord` 包装 + `probeDoneInputSchema`（`src/core/contracts/probe.ts:47`） | 经 `serverExecute`（`src/agent/tool-execute.ts:196`）包装为 JSON 文本：`{ ok: false, error: "..." }`（注意：`isError` 未置 `true`，通过业务字段 `ok: false` 告知模型修正） | `toToolResult({ text: PROBE_DONE_ACK_TEXT, details: { ok: true } })`（`probe.ts:92-95`；因满足 `isImageResult` 形状判定 `tool-execute.ts:149-152`，模型收到 `content: [{ type: "text", text: PROBE_DONE_ACK_TEXT }]`，记录保存 `details: { ok: true }`，**无 `terminate: true`**） |
+| `probe_done` | `probeDoneTool(ctx)`（`src/agent/tools/probe.ts:49-99`） | 仅 prober 注册表，始终存在 | `healToolRecord` 包装（`tools.ts:317`）；`parameters: probeDoneInputSchema`（`src/core/contracts/probe.ts:47`）；Schema 不符走信道 A | 守卫拒绝走信道 C：`{ ok: false, error }`，`isError` 不置位 | `{ text: PROBE_DONE_ACK_TEXT, details: { ok: true } }`（`probe.ts:92-95`）。`toToolResult()` 因 `isImageResult()`（`tool-execute.ts:151-155`）判定为真，产出 `content: [{ type: "text", text: PROBE_DONE_ACK_TEXT }]`、`details: { ok: true }`；**无 `terminate`** |
 
-- **`probe_done` 的三条业务守卫（`src/agent/tools/probe.ts:66-79`）**：
-  1. `!record` → 返回 `{ ok: false, error: "Chat not found: ..." }`（`:67`）。
-  2. `hasUnresolvedQuestion(record.messages)` 为真 → 返回 `{ ok: false, error: "A question is still open — resolve it (or let him answer) before concluding the probe. probe_done only fires with no question outstanding." }`（`:69-75`）。
-  3. `probeConcluded(record.messages)`（即 `hasProbeDone(record.messages)`，`:21-23`）为真 → 返回 `{ ok: false, error: "The probe is already concluded — probe_done fires exactly once." }`（`:77-79`）。
-- **闭包依赖注入**：`probeDoneTool` 接收 `ProbeDoneContext`（`src/agent/tools/probe.ts:9-16`），由 `chat-handler.ts:509-512` 注入 `chatId`、`chatStore: stores.chatStore` 以及 `deliver: (steer) => void deliverJobResult(steer)`，因此 `src/agent/tools/probe.ts` 无需违反 `eslint.config.mjs` 去导入 `src/server/jobs.ts`。
+- **守卫**（`probe.ts:66-79`）：
+  1. `!record` → `{ ok: false, error: \`Chat not found: ${ctx.chatId}\` }`（`:67`）。
+  2. `hasUnresolvedQuestion(record.messages)` → 拒绝（`:69-76`）。该函数（`native-messages.ts:746-748`）对最新 assistant 消息中任何未配对的问题调用都返回真，包括 `streaming`、`malformed`、`failed` 状态。
+  3. `probeConcluded(record.messages)`（`probe.ts:21`，即 `hasProbeDone`）→ 拒绝（`:77-79`）。
+  - 【推断】守卫读取的是 `ctx.chatStore.getChat()` 返回的持久化记录（`:66`），不包含本回合尚未持久化的消息。
+- **闭包注入**：`chat-handler.ts:532-549` 传入 `chatId`、`chatStore: stores.chatStore`、`deliver: (steer) => void deliverJobResult(steer)`（`:536`）等，因此 `src/agent/tools/probe.ts` 无需导入 `src/server/jobs.ts`（Zone 4）。
+- **入队失败**：`ctx.deliver` 抛错被 `try/catch` 吞掉并记日志（`probe.ts:80-87`）；注释称交接可由下一次客户端消息经分派条件恢复。
 
-### 阶段四：循环控制钩子与跨回合状态跃迁
+### 阶段四：循环控制与跨回合状态
 
-1. **为什么 `probe_done` 不带 `terminate: true`**：
-   - 如 `probe_done` 工具描述（`src/agent/tools/probe.ts:61`）所示：*"After it succeeds, say your closing sentence and end your turn."*
-   - `probe_done` 返回后，当前 `ProberAgent` 循环继续走完最后一个模型生成步（让 Prober 说完过渡结语），然后自然结束回合。
-2. **为什么 `probe-handoff` 严禁走 Vehicle 1（Live Steering）而必须走 Vehicle 2（Idle Wake）**：
-   - 在 `probe_done` 的 `execute` 内部（`src/agent/tools/probe.ts:81`），调用 `ctx.deliver(buildProbeHandoffSteer(ctx.chatId))` 时，**`ProberAgent` 的回合仍在运行中**（`isTurnRunning(chatId) === true`）。
-   - 如果此时 `jobs.ts` 的 `pump` 将 `probe-handoff` 通过 `live.steer()` 注入当前运行的 Agent，那么接管并处理该 handoff 的将是**还没有退出的 `ProberAgent`**（它既没有 `Teacher` 的系统提示词，也没有 `plan_init` 工具）！
-   - 因此，`src/server/jobs.ts` 在两处设置了专门的硬性拦截：
-     - `handOffEligible`（`src/server/jobs.ts:265`）：`if (!entry.waking && !entry.deferred && entry.handedTo !== agent && entry.steer.customType !== "probe-handoff")`，显式跳过 `probe-handoff`，绝不调用 `agent.steer`。
-     - `pump` 循环（`src/server/jobs.ts:519-535`）：检测到 `handoffWaits` 为真时，不提前 `return`，而是落入下方的 `await waitForIdle(chatId)`（`:535`），一直等到 `ProberAgent` 回合彻底结算并释放 `turn-liveness` 锁。
-3. **Idle Wake 启动新回合与角色跃迁**：
-   - 当 `ProberAgent` 回合结束，`waitForIdle(chatId)` 放行，`pump` 调用 `await s.turnRunner(chatId, { type: "steers", steers })`（`src/server/jobs.ts:582`）。
-   - `turnRunner` 重新进入 `chat-handler.ts`，此时 write-ahead 持久化已包含上一回合的 `probe_done` 调用与结果，`hasProbeDone(agentMessages)`（`src/server/chat-handler.ts:418`）返回 `true`，回合 2 正式构造 `createTeacherAgent`（`:496`）。
+1. **为什么不带 `terminate`**：工具描述要求成功后「say your closing sentence and end your turn」（`probe.ts:61`）。`probe_done` 不在 `QUESTION_TOOLS` 中，`makeQuestionStopper` 返回 `false`；批次未 terminate，`hasMoreToolCalls` 为真（`agent-loop.js:172`），循环再调用一次模型生成结语；该响应无工具调用后循环自然结束。
+2. **为什么 `probe-handoff` 不走载具 1**：`ctx.deliver` 执行时 prober 回合仍在运行；若注入运行中的 Agent，处理交接文本的仍是 prober（prober 注册表中没有 `plan_init`，`tools.ts:317-347`）。拦截有两处：
+   - `handOffEligible()` 条件中的 `entry.steer.customType !== "probe-handoff"`（`jobs.ts:267`）。
+   - `pump()` 的 `handoffWaits`（`jobs.ts:524-526`）：队列中有其他可交给活跃回合的条目时，不提前返回而是等待回合结束后重新循环（`:530-534`）；队列中只有交接时直接落到 Idle Wake（`:540`）。
+   - 注释依据：`jobs.ts:27-30`、`:521-523`。
+3. **Idle Wake 与角色切换**：回合 1 结算后 `waitForIdle` 放行，`turnRunner`（由 `setTurnRunner` 在 `chat-handler.ts:141` 注册）重新进入 handler；此时记录中已有回合 1 的 `probe_done` 调用与结果，`hasProbeDone` 为真，构造 teacher。
 
-### 阶段五：结算、计费过滤与未消费 Steer 回收
+### 阶段五：结算、计费与回收
 
-- **幂等投递确认**：`buildProbeHandoffSteer(chatId)`（`src/core/contracts/jobs.ts:439`）调用 `newHandoffMessage(chatId)`（`src/core/native-messages.ts:227`），生成确定性 ID（`steer_probe_${chatId}`，见 `jobs.ts:445` 注释）。当 `turnRunner` 返回 `status === 200` 且 `!jobIdOf(entry.steer)`（`probe-handoff` 无关联后台 job，`jobIdOf` 返回 `null`，`src/server/jobs.ts:174,597`）时，调用 `completeEntry(chatId, entry)`（`:599`）移出队列。
-- **降级自愈能力**：即使 `ctx.deliver(...)` 排队异常（`src/agent/tools/probe.ts:82-87` try/catch 吞掉异常仅打日志），因为 `probe_done` 的工具调用和 `{ ok: true }` 结果已经随回合 1 落盘，用户下一次发送任何消息时，`hasProbeDone(agentMessages)` 依然为 `true`，系统仍能自动构造 `TeacherAgent`。
+- **计费过滤**（`teacher-agent.ts:276-285`）：仅对 assistant 的 `message_end` 且带 `usage` 的事件计费；`stopReason === "aborted"`、`!usageWasAdmitted(usage)`、或 `opts.requestCycle && !opts.requestCycle.acceptsUsage(message)` 时跳过。
+- **回合 1 结算**：`unregisterLiveAgent(chatId)` → `settleSteers(chatId, stamped, false, constructed)`（`chat-handler.ts:679-680`）。交接不在 `stamped` 中且未 `handedTo` → 保留在队列并调用 `pump`；由于原 pump 仍在运行（`pumping` 集合，`jobs.ts:482`），新调用直接返回。
+- **回合 2 确认**：`buildProbeHandoffSteer(chatId)`（`src/core/contracts/jobs.ts:428-430`）调用 `newHandoffMessage(chatId)`，ID 为 `steer_probe_${chatId}`（`native-messages.ts:229`）。唤醒返回 `status === 200` 且 `!jobIdOf(entry.steer)`（`jobIdOf()` `jobs.ts:175-178`）时 `completeEntry()`（`:603-605`）。
+- **降级恢复**：即使交接入队失败，回合 1 已落盘的 `probe_done` 结果使下一次任意请求的 `hasProbeDone` 为真，仍会构造 teacher（注释 `probe.ts:84-86`）。
 
 **测试佐证**
-- `tests/chat-flow.test.ts` 中通过注入自定义 `buildAgent` 工厂（对应 `src/server/chat-handler.ts:469` 的 `buildAgent` 测试缝）或直接调用 `createTeacherAgent(undefined, { engine, messages: opts.messages })`（`tests/chat-flow.test.ts:107`）验证无状态回合重建与工具执行行为。
+- 交接不走活跃回合：`tests/jobs.test.ts:1181`（`"a probe-handoff NEVER rides a live run — it waits the turn out and wakes"`）。
+- 注入假引擎重建 Agent：`tests/chat-flow.test.ts:107`（`createTeacherAgent(undefined, { engine, messages: opts.messages })`），另见 `:929`、`:1330`。

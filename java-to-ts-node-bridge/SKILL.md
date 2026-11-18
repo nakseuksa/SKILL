@@ -1,269 +1,302 @@
 ---
 name: java-to-ts-node-bridge
-description: 面向具有 Java Web（Spring Boot / JVM 多线程 / JDBC 事务 / 名义类型 OOP）经验的开发者，以运行时物理实现与编译期契约视角，对比拆解本工作区（learnharness）的 TypeScript 类型系统、Node.js 单线程事件循环与 globalThis 锁/信号量、六边形端口与函数式闭包依赖注入、Next.js 16 双端模块边界及 Web Streams 流式 I/O。每条结论必须先用 grep/read 取证并带 path:line 出处。
+description: 面向具有 Java Web（Spring Boot / JVM 多线程 / JDBC 事务 / 名义类型 OOP）经验的开发者，以「编译期契约 + 运行时物理机制」视角，对比拆解本工作区（learnharness）的 TypeScript 类型系统、Node.js 单线程事件循环与 globalThis 锁/信号量、六边形端口与函数式闭包依赖注入、Next.js 16 双端模块边界、Web Streams 与同步 fs 写盘语义。每条结论必须先用 grep/read 取证并带 path:line 出处。Use when 用户看到陌生的 TS 类型构造、困惑于为何不用线程池/事务/IoC 容器、排查 globalThis 状态或 await 竞态、遇到 eslint import/no-restricted-paths 报错或客户端打包混入 Node 模块时。
 ---
 
 # SKILL: Java → TS/Node/Next.js 心智迁移拆解 (Java-to-TS/Node Mental Model Bridge)
 
 ## 0. 目标与适用范围
 
-帮助具有 Java Web 开发经验的读者**从代码与运行时物理层级理解工作区项目（`learnharness`）中的 TypeScript / Node.js / Next.js 16 机制**：通过精准对标 Java/Spring 参照系，消除因“语法看似相近但运行时语义截然不同”导致的误判。
+帮助具有 Java Web 经验的读者**从代码与运行时物理层级理解 `learnharness` 中的 TypeScript / Node.js / Next.js 16 机制**：用精确的 Java/Spring 参照物定位「表面相似、底层语义不同」的陷阱。
 
 - 适用：
-  - TypeScript 结构化类型、可辨识联合类型（Discriminated Unions）、模块声明合并（`declare module`）、TypeBox/Zod 运行时 Schema 校验。
-  - Node.js 单线程事件循环下的并发控制：`globalThis` 进程级状态池、Promise 链 FIFO 互斥锁、异步信号量、`AbortController` 取消传播。
-  - 无 IoC 容器的函数式依赖注入：六边形端口接口（`src/core/ports.ts`）、唯一组合根（`src/server/stores.ts`）、高阶工厂函数与闭包捕获、`eslint.config.mjs` 强制模块红线。
-  - Next.js 16 App Router 服务端/客户端同构边界、Barrel（`src/core/index.ts` / `src/server/index.ts`）打包隔离。
-  - Web `ReadableStream` / `AsyncGenerator` SSE 流式传输与同步 `fs` 写盘的崩溃语义。
+  - M1 TypeScript 结构化类型、可辨识联合、模块声明合并（`declare module`）、TypeBox 运行时校验。
+  - M2 无 IoC 容器的依赖注入：端口接口（`src/core/ports.ts`）、组合根（`src/server/stores.ts`）、工厂闭包、`eslint.config.mjs` 模块红线。
+  - M3 单线程事件循环并发：`globalThis` 进程级状态、Promise 链互斥锁、异步信号量、`AbortSignal` 取消传播。
+  - M4 Next.js 16 App Router 服务端/客户端边界、Barrel（`src/core/index.ts` / `src/server/index.ts`）打包隔离。
+  - M5 Web `ReadableStream` / `AsyncGenerator` SSE 消费与同步 `fs` 写盘的崩溃语义。
 - 不适用：
-  - 单条端到端 HTTP 业务调用链的逐行步骤追踪（交 `code-execution-trace`）。
-  - 系统提示词工程与教学法设计意图分析（交 `agent-harness-dissector`）。
+  - 单条端到端业务调用链的逐行追踪（交 `code-execution-trace`）。
+  - 提示词、工具控制流、Steer 投递（交 `agent-harness-dissector`）。
+  - 消息双投影与客户端状态机的数据形态（交 `data-model-state-projection`）。
 
-核心原则只有一条：**对比必须落在物理机制上，而不是落在名词类比上。** 一句笼统的“这相当于 Spring 的 Singleton Bean”而不指出 `globalThis` 在 Next dev 多模块实例下的生命周期差异，比不对比危害更大。
+核心原则：**对比必须落在物理机制上，而不是落在名词类比上。** 只写「相当于 Spring Singleton Bean」而不指出 `globalThis` 的生命周期差异，比不对比危害更大。
+
+### 0.1 适用前提（每次输出必须显式声明）
+本 Skill 中「同步代码段天然互斥」「`globalThis` 即全局单例」「同步 `fs` 读-改-写不交错」三条结论**只在单 Node 进程、单事件循环、未使用 `worker_threads` 的部署下成立**。多进程（cluster、多实例 `next start`、Serverless）下这些原语全部失效。若分析对象的正确性依赖这三条，输出中必须写一行「前提：单进程部署」。
 
 ---
 
 ## 1. 证据规则（最高优先级，先于一切格式要求）
 
-1. **先取证，后叙述。** 写出本仓库任何函数、常量、类型、文件、环境变量或 ESLint 规则之前，必须已经用 `grep` / `glob` / `read` 在本次会话中确认其存在。
-2. **出处格式统一为 `path:line`**（相对仓库根目录），在该标识符**首次出现**时附上。例：`withBgLlmSlot()`（`src/agent/subagents/bg-llm-semaphore.ts:52`）。
-3. **三级置信标记**，凡不是“读到代码原文”的内容都必须标注：
-   - 无标记 = 已读到代码原文，直接陈述。
-   - `【推断】` = 由已读代码的顺序/事件循环机制推出，但没有直接读到对应代码或测试（例：两个并发请求在某个 `await` 挂起点交错时的内存状态）。
-   - `【未验证】` = 没有读到相关代码（例：某个第三方库内部的流缓冲实现未打开看）。
-4. **禁止为满足格式而补写。** 模板中的某一项在当前机制中不存在时，写 `N/A — <原因>`，不得虚构机制。
-5. **签名照抄。** TypeScript 类型定义、接口字段、函数参数列表与返回类型以源码为准逐字抄写，不得凭记忆“简化”成伪代码。
-6. **框架行为不凭记忆。** 涉及 Next.js 16 的路由、缓存、Server/Client Component 边界时，按 `AGENTS.md` 要求先读 `node_modules/next/dist/docs/` 中对应文档；读不到则标 `【未验证】`。
+0. **锚点复核。** 开始前执行 `git rev-parse --short HEAD` 记录版本；第 9 节示范案例中的行号仅对该案例标注的 commit 有效，引用前用 `grep -n "<函数名>" <文件>` 重新定位。
+1. **先取证，后叙述。** 任何本仓库函数、常量、类型、文件、环境变量、ESLint 规则写出前，必须已在本次会话中 `grep` / `glob` / `read` 确认存在。
+2. **出处格式 `path:line`**（相对仓库根），在标识符**首次出现**时附上。例：`withBgLlmSlot()`（`src/agent/subagents/bg-llm-semaphore.ts:52`）。
+3. **三级置信标记**：
+   - 无标记 = 已读到代码原文。
+   - `【推断】` = 由已读代码与事件循环规则推出，但无直接代码或测试佐证（例：两个请求在某个 `await` 处交错后的内存状态）。
+   - `【未验证】` = 未读到相关代码或文档。
+4. **注释不是代码。** 仅由源码注释支撑的结论（例如「Next dev 按路由编译独立模块实例」）必须写成「注释称…（`path:line`）」，并按第 6 条核对框架文档；无法核对时标 `【未验证】`。
+5. **第三方包可取证。** `node_modules/<pkg>/dist/*.js` 可以直接 `read`；读到则无标记并给出 `node_modules/...:line`，未读则标 `【未验证】`。
+6. **框架行为不凭记忆。** Next.js 路由/缓存/Server-Client 边界先查 `node_modules/next/dist/docs/`；查不到标 `【未验证】`。
+7. **禁止为满足格式而补写。** 模板项不存在写 `N/A — <原因>`。
+8. **签名逐字抄写。** 类型定义、函数签名、对象字面量以源码为准，不得把被包装的值写成裸值（例：`stores` 的每个字段都经过 `traceObject(...)` 包装，不能写成 `{ chatStore, graphStore }`）。
 
 ---
 
 ## 2. 表达规则
 
-### 2.1 禁止
-- **浅层名词替换**：只写“相当于 `@Autowired` / `synchronized` / `@Transactional`”，不交代底层执行差异。
-- **混淆编译期与运行时**：把 TypeScript 的 `interface` / `type` 当成运行时存在的类或反射元数据。
-- **混淆阻塞线程与挂起协程**：把 `await promise` 说成“阻塞线程”，或把 `fs.writeFileSync` 说成“异步非阻塞”。
-- **未解释的自造术语**：任何既不是本仓库代码标识符、也不是标准 Java/Node 规范术语的名词。
+### 2.1 术语表（首次使用时按此定义，禁止自造其他说法）
+| 术语 | 定义 |
+|---|---|
+| 同步段 | 两个让出点之间连续执行的 JS 代码；单进程内不会被其他 JS 回调打断 |
+| 让出点 | `await`、`yield`、回调注册后返回事件循环的位置；此后其他请求的 JS 可以执行 |
+| 交错窗 | 一个让出点挂起到恢复之间的时间段；此期间共享状态可能被其他回调修改 |
+| async 函数 | 不称「协程」或「线程」；它是返回 Promise 的函数，挂起时不占用线程 |
 
-### 2.2 允许（并鼓励）
-- **精确的 Java 标准库/框架参照物**：如 `java.util.concurrent.Semaphore`、`ReentrantLock`、`ThreadLocal`、Spring `ApplicationContext`、Jackson `@JsonTypeInfo`、Servlet `AsyncContext`。
-- **开头 ≤3 行的总览**，用于快速定位机制类别与核心差异。
-- **Mermaid 内存布局图 / 事件循环交错时序图**：图中每个本仓库节点必须是真实文件、函数或变量名。
+### 2.2 禁止
+- 浅层名词替换：只写「相当于 `@Autowired` / `synchronized` / `@Transactional`」不交代差异。
+- 把 `interface` / `type` 当成运行时存在的类或反射元数据。
+- 把 `await` 说成「阻塞线程」；把 `fs.writeFileSync` 说成「非阻塞」。
+- 把源码中有已知缺陷的机制描述为「保证」（见第 6.1 条第 4 点）。
 
-### 2.3 Java vs. TS/Node 机制对比的标准四行表
-凡进行机制对比，必须包含以下四行：
+### 2.3 允许（并鼓励）
+- 精确的 Java 参照物：`java.util.concurrent.Semaphore`、`ReentrantLock`、`ThreadLocal`、`CompletableFuture`、Spring AOP 代理、`ApplicationContext`、Jackson `@JsonTypeInfo`、Servlet `AsyncContext`、ArchUnit。
+- 对应的 Node 参照物：`AsyncLocalStorage`（对标 `ThreadLocal`）、`worker_threads`（对标真正的多线程）。
+- 开头 ≤3 行总览；Mermaid 事件循环交错时序图（参与者必须是真实文件/函数/变量）。
 
-| 对比维度 | Java Web 机制（参照系） | 本仓库 TS/Node/Next.js 实现（带 `path:line`） | 核心差异与迁移陷阱 |
+### 2.4 标准四行对比表（凡做机制对比必须包含）
+| 对比维度 | Java Web 机制（参照系） | 本仓库实现（带 `path:line`） | 核心差异与迁移陷阱 |
 |---|---|---|---|
-| **编译期 vs. 运行时存在性** | 如：字节码保留类型，运行期可反射 / `instanceof` | 如：TS 类型擦除；运行期靠判别字段 `role` / `customType` 或 TypeBox/Zod 校验 | ... |
-| **内存作用域与生命周期** | 如：JVM 堆内 Spring Singleton Bean | 如：`globalThis.__lhLlmSlots`（跨 Next dev 路由模块实例共享，进程重启清空） | ... |
-| **调度与并发交错边界** | 如：OS 线程任意指令抢占，需 `synchronized` 保护临界区 | 如：单线程事件循环，同步代码段天然原子，唯 `await` 处让出执行权 | ... |
-| **异常与取消传播** | 如：`Thread.interrupt()` / `InterruptedException` / 事务回滚 | 如：`AbortSignal` 事件监听 + `Promise.race` 抛出 `err.name = "AbortError"` | ... |
+| **编译期 vs. 运行时存在性** | 字节码保留类型，可反射 / `instanceof` | TS 类型擦除；运行期靠判别字段或 TypeBox 校验 | … |
+| **内存作用域与生命周期** | Spring Bean 随 `ApplicationContext` 存活 | `globalThis.__lh*` 随进程存活，重启清空 | … |
+| **调度与交错边界** | OS 线程任意指令处可被抢占 | 单线程；只在让出点交错 | … |
+| **异常与取消传播** | `Thread.interrupt()` / `InterruptedException` / 事务回滚 | `AbortSignal` 监听 + `err.name = "AbortError"`；无自动回滚 | … |
 
 ---
 
 ## 3. 工作流程
 
-1. **定位目标代码**：`grep` / `read` 用户指定的模块、类型、锁、端口或配置，确认 `path:line`。
-2. **识别映射域（见第 4 节）**：判定目标属于 M1（类型系统）、M2（DI 与架构边界）、M3（单线程并发与锁）、M4（Next.js 同构与打包边界）、M5（流与 I/O 语义）中的哪一类或哪几类。
-3. **追踪上下游契约**：
-   - 若是类型：找到定义处、构造处、以及消费处的类型收窄（Type Narrowing）或 Schema 校验处。
-   - 若是 DI/端口：找到接口定义（`src/core/ports.ts`）、适配器实现（`src/store/`）、组合根装配（`src/server/stores.ts`）与闭包注入点。
-   - 若是并发原语：找到 `globalThis` 挂载点、入队/获取点、`await` 挂起点、`finally` 释放点及 `AbortSignal` 处理点。
-4. **套用 5 维拆解模板（第 5 节）**，并应用第 6 节专项规则。
-5. **补充测试佐证**：`grep` `tests/` 中对该机制的单元测试（`tests/xxx.test.ts:line`），对照 JUnit/Mockito 说明本仓库如何做无容器确定性测试。
-6. **执行第 8 节自检清单**，修正后再输出。
+1. **锚点复核**（第 1 节第 0 条）。
+2. **定位目标代码**：`grep` / `read` 用户指定的模块、类型、锁、端口或配置。
+3. **归类映射域**（第 4 节）。
+4. **追踪上下游**：
+   - 类型：定义处 → 构造处 → 消费处的收窄或校验。
+   - DI：端口（`src/core/ports.ts`）→ 适配器（`src/store/`）→ 组合根（`src/server/stores.ts`）→ 工厂调用点（如 `src/server/chat-handler.ts`）→ 闭包使用点。
+   - 并发原语：`globalThis` 挂载点 → 获取点 → 每个让出点 → `finally` 释放点 → `AbortSignal` 处理点；**额外推演一次「排队者中止」路径**（第 6.1 条第 4 点）。
+5. **套用 5 维模板**（第 5 节）与专项规则（第 6 节）。
+6. **补充测试佐证**：`grep tests/`；**找不到覆盖测试时如实写「无测试覆盖」**，这本身是结论。
+7. **执行第 8 节自检**。
 
 ---
 
-## 4. 五大心智迁移域切分法则
+## 4. 五大心智迁移域
 
-拆解前必须先将问题归入以下 5 个正交域之一（复合模块按域分节展开）：
-
-| 域编号 | 域名称 | 代码特征 | 必查的核心问题 |
+| 域 | 名称 | 代码特征 | 必查问题 |
 |---|---|---|---|
-| **M1** | **类型系统与运行时校验** | `type A = B \| C`、`declare module`、`Type.Object`（TypeBox）、`z.object`（Zod）、类型谓词 `x is Y` | 编译擦除后 JS 对象长什么样？靠哪个判别属性做分支收窄？进程边界（HTTP / LLM Tool）靠什么做运行时校验？ |
-| **M2** | **六边形 DI 与模块红线** | `ports.ts` 接口、`stores.ts` 装配、`createXxx(deps)` 工厂闭包、`eslint.config.mjs` 的 `zones` | 为什么不用 `@Autowired`？依赖如何通过函数闭包传递？违反哪条 ESLint zone 会导致 CI 报错？ |
-| **M3** | **事件循环并发与内存协调** | `globalThis.__lh*`、`async/await`、`new Promise` 队列、`Set`/`Map` 注册表、`AbortController` | 同步段为何不需要锁？哪个 `await` 会让出控制权导致竞态？为什么必须挂 `globalThis` 而非模块顶层 `const`？ |
-| **M4** | **Next.js 16 同构与 Barrel 隔离** | `app/**/page.tsx`、`app/api/**/route.ts`、`"use client"`、`src/core/index.ts`、`src/server/index.ts` | 该文件在 Node 还是浏览器执行？为什么 `src/core/index.ts` 刻意排除含 `node:crypto` / 重依赖的模块？ |
-| **M5** | **Web Streams 与同步文件 I/O** | `ReadableStream`、`async function*`、`fs.writeFileSync`、`fs.appendFileSync`、`fs.renameSync` | 为什么用同步 `fs` 而不是异步 `fs.promises`？无数据库事务时如何靠写入顺序与读取端容错保证崩溃一致性？ |
+| **M1** | 类型系统与运行时校验 | `type A = B \| C`、`declare module`、`Type.Object`（TypeBox）、`x is Y` | 擦除后对象长什么样？靠哪个判别字段收窄？HTTP body / 磁盘 JSON / LLM 工具参数进入系统时由哪个函数做运行时校验？ |
+| **M2** | 端口 DI 与模块红线 | `ports.ts`、`stores.ts`、`createXxx(deps)`、`eslint.config.mjs` 的 `zones` | 依赖经哪个参数/闭包传入？组合根在哪一行装配？违反哪个 zone？ |
+| **M3** | 事件循环并发 | `globalThis.__lh*`、`async/await`、`new Promise` 队列、`Map`/`Set` 注册表、`AbortController` | 同步段为何不需要锁？哪个让出点打开交错窗？中止路径是否仍保持互斥？ |
+| **M4** | Next.js 同构与 Barrel 隔离 | `app/**/page.tsx`、`app/api/**/route.ts`、`"use client"`、`src/core/index.ts`、`src/server/index.ts` | 该文件在 Node 还是浏览器执行？Barrel 是否真的只导出浏览器安全模块？ |
+| **M5** | 流与同步文件 I/O | `ReadableStream`、`async function*`、`fs.writeFileSync`、`fs.appendFileSync`、`fs.renameSync` | 写法属于直接覆盖 / 原子替换 / 追加中的哪一种？崩溃后读取端如何容错？同步调用阻塞事件循环多久？ |
 
 ---
 
 ## 5. 单机制 5 维拆解模板
 
-每个目标机制按顺序展开以下 5 个维度。**不存在的维度写 `N/A — <原因>`。**
+不存在的维度写 `N/A — <原因>`。
 
 ### 维度一：源码定位与签名原貌
-- 入口文件与标识符 `path:line`，以及它在系统分层（`app` / `components` / `server` / `agent` / `core` / `store`）中的位置。
-- 逐字抄写核心类型定义或函数签名。
+- `path:line`、所属层（`app` / `components` / `server` / `agent` / `core` / `store`）。
+- 逐字抄写核心类型或函数签名。
 
-### 维度二：Java Web 对标参照（同构点 vs. 异构点）
-- 指出最贴近的 Java/Spring 概念。
-- 填写 **第 2.3 节标准四行对比表**（编译期 vs. 运行时、内存作用域与生命周期、调度与并发交错边界、异常与取消传播）。
+### 维度二：Java 对标（同构点 vs. 异构点）
+- 最贴近的 Java/Spring 机制（写到具体类或注解）。
+- 第 2.4 节四行对比表。
 
-### 维度三：物理运行机制拆解
-- 按所处域（M1~M5）展开物理实现细节（见第 6 节专项规则）：
-  - **状态存放位置與结构**（如 `globalThis` 上的字段名与类型）。
-  - **执行与挂起序列**：标出同步原子段与每一个 `await` 挂起点。
-  - **类型/数据在内存中的实际形态**。
+### 维度三：物理运行机制
+- 状态存放位置与结构（`globalThis` 字段名、类型、定义行）。
+- 执行序列：逐个标出同步段与让出点。
+- 若有中止/异常路径：逐步推演，并判断不变式（互斥、计数守恒）是否保持。
 
-### 维度四：Java 惯性反模式与防坑守则
-- 列出 2~3 条若按 Java Web 习惯修改此处代码会引发的**具体工程事故**（必须写明触发的编译器错误、ESLint 规则名、运行时死锁或竞态现象）。
+### 维度四：Java 惯性反模式
+- 2~3 条「按 Java 习惯改写会出什么事故」，每条写明可观测后果（编译错误文本 / ESLint zone 消息 / 死锁 / 竞态）。后果若是推演出来的，标 `【推断】`。
 
-### 维度五：确定性测试验证对照（`node:test` vs. JUnit/Mockito）
-- 引用 `tests/*.test.ts:line` 中的真实测试代码，说明本仓库如何不借助 Spring TestContext 或字节码 Mock 框架，仅靠函数参数/接口注入完成隔离测试。
+### 维度五：测试验证对照
+- 引用 `tests/*.test.ts:line`，说明如何不借助 Spring TestContext / Mockito，只靠参数注入完成隔离。
+- 无覆盖测试时写「N/A — 无测试覆盖（grep 关键字：…）」。
 
 ---
 
 ## 6. 专项规则
 
-### 6.1 分析并发原语（域 M3）：必须标出「同步原子段」与「`await` 交错窗」
-Node.js 在单个事件循环线程中运行 JS 代码。拆解任何锁、信号量或注册表时，必须明确区分：
-1. **同步检查并置位（Check-Then-Act）**：若 `if (!inFlight.has(id)) inFlight.add(id)` 之间**没有任何 `await`**，则在单进程内天然互斥，无需 Java 的 `synchronized` 或 `ConcurrentHashMap.putIfAbsent`。
-2. **`await` 交错窗（Interleaving Window）**：一旦遇到 `await`，当前协程挂起，事件循环可立即执行其他 HTTP 请求或定时器回调。必须指明：`await` 恢复后，哪些内存状态或磁盘文件可能已被其他协程修改（例如为何必须在 `await` 锁之后重新读取权威记录或检查 `signal?.throwIfAborted()`）。
-3. **为什么挂 `globalThis`**：必须说明 Next.js 开发模式下按路由入口独立编译模块实例的机制——模块顶层 `const map = new Map()` 在不同路由中会分裂成多个实例，唯有挂在 `globalThis` 上才能实现单进程全局单例。
+### 6.1 并发原语（M3）
+1. **同步检查并置位**：`if (cond) mutate` 之间没有让出点时，单进程内天然互斥，不需要 `synchronized` / CAS。
+2. **交错窗**：每个让出点之后，必须写明哪些共享内存或磁盘文件可能已被修改，以及代码是否在恢复后重读或 `signal?.throwIfAborted()`。
+3. **为什么挂 `globalThis`**：引用源码注释（如 `src/agent/subagents/bg-llm-semaphore.ts:41-43`、`src/server/jobs.ts:55-57`），按第 1 节第 4 条处理其可信度；同时说明 dev 热重载重新求值模块时，模块顶层状态会被重置而 `globalThis` 上的不会。
+4. **中止路径必须重新验证不变式**。Promise 链锁、信号量在「排队者被中止」时最容易破坏互斥或计数。必须给出反例推演或证明，不得因为源码注释写了 "successors never hang" 就等同于「互斥成立」。
+5. **可重入性**：JS 没有线程身份，Promise 链锁天然不可重入；若要可重入，需要用 `AsyncLocalStorage` 自行记录持有者。
 
-### 6.2 分析依赖注入与架构红线（域 M2）：必须对照 `eslint.config.mjs` 四条铁律
-凡涉及模块引用或 DI 设计，必须核对 `eslint.config.mjs:41-70` 定义的四个 `import/no-restricted-paths` 区域：
-- **Zone 1（`:42-49`）**：`./components` 导入 `./src` 时，仅允许 `./core/index.ts`（即 `@/src/core`）。
-- **Zone 2（`:50-56`）**：`./app` 导入 `./src` 时，仅允许 `./core/index.ts` 与 `./server/index.ts`。
-- **Zone 3（`:57-62`）**：`./src/core` 严禁导入 `./src/agent`、`./src/server`、`./src/store`。
-- **Zone 4（`:63-68`）**：`./src/agent` 严禁导入 `./src/server`、`./src/store`。
+### 6.2 依赖注入与模块红线（M2）：核对 `eslint.config.mjs:41-70`
+| Zone | 行号 | `target` | `from` | `except`（**相对 `from` 解析**，见注释 `:45`） |
+|---|---|---|---|---|
+| 1 | `:42-49` | `./components` | `./src` | `./core/index.ts` |
+| 2 | `:50-56` | `./app` | `./src` | `./core/index.ts`、`./server/index.ts` |
+| 3 | `:57-62` | `./src/core` | `./src/agent`、`./src/server`、`./src/store` | — |
+| 4 | `:63-68` | `./src/agent` | `./src/server`、`./src/store` | — |
 
-### 6.3 分析类型系统（域 M1）：必须区分「编译期窄化」与「运行时校验」
-- 说明联合类型（如 `LhMessage`）在编译期如何通过 `if (m.role === "custom")` 触发 TypeScript 控制流类型收窄（Control Flow Narrowing）。
-- 说明外部输入（HTTP body、磁盘 JSON、LLM tool arguments）进入系统时，TypeScript 类型完全擦除，必须指出具体的运行时校验函数或 Schema（如 `Type.Object` / `zod` / 手写形状守卫函数 `path:line`）。
+- 未被禁止的方向同样要写明：例如 `src/server` 可以导入 `src/agent`（`src/server/jobs.ts:71` 导入 `../agent/subagents/aborts.ts`）。
+- ESLint 只约束 import 路径，**不约束** `src/core` 内部是否使用 `node:` 内建模块（见 6.4）。
+
+### 6.3 类型系统（M1）
+- 编译期：说明 `if (m.role === "custom")` 等判别如何触发控制流收窄。
+- 运行时：外部输入进入系统时，指出具体的校验函数或 Schema 及其 `path:line`；LLM 工具参数的校验点在 `@earendil-works/pi-agent-core` 的 `prepareToolCall()`（`node_modules/@earendil-works/pi-agent-core/dist/agent-loop.js:487-545`，调用 `validateToolArguments`），校验失败转成 `isError: true` 的工具结果而不是抛出。
+
+### 6.4 Barrel 与打包边界（M4）
+- `src/core/index.ts:1-4` 头注释声称导出内容「no node builtins」，但该文件 `:86` 重新导出了 `./coverage.ts`，而 `src/core/coverage.ts:22` 导入 `node:crypto`。分析客户端打包问题时必须核对此类不一致；是否真的进入浏览器 bundle，取决于打包器的 tree-shaking 与客户端实际引用，未验证时标 `【未验证】`。
+
+### 6.5 写盘（M5）：区分三种写法，并写出阻塞代价
+| 写法 | 本仓库实例 | 崩溃语义 |
+|---|---|---|
+| 直接覆盖 | `writeChat()`（`src/store/chats.ts:58`，`fs.writeFileSync`） | 非原子；可能留下截断文件。`ChatStore.getChat` 对损坏文件返回 `null`（接口注释 `src/core/ports.ts:38`） |
+| 原子替换 | `rewriteLedgers()`（`src/store/graph.ts:217`，tmp + `fs.renameSync` `:238`） | 旧文件或新文件二选一；可能残留 tmp |
+| 追加 | `appendLine()`（`src/store/graph.ts:53-57`，`fs.appendFileSync`） | 末行可能截断；`readRawLines()`（`:59-78`）跳过坏行 |
+
+- 同步 `fs` 的取舍必须两面都写：好处是一个同步段内读-改-写不会被其他请求交错（前提见 0.1）；代价是调用期间整个事件循环停顿，所有并发请求与 SSE 推送一起等待。
+- 没有跨文件事务：多文件写入的恢复语义只能靠写入顺序加读取端容错。
 
 ---
 
 ## 7. 负面约束
 
-1. **严禁伪造 Java 映射。** 如果某个机制（如浏览器端纯 TS 投影或 React/Next 特有机制）在后端 Java 中无直接对应，如实写明差异，不得强行附会。
-2. **路径不可悬空。** 任何本仓库标识符首次出现都带 `path:line`。
-3. **严禁忽略 `await` 边界。** 分析异步函数时，漏掉 `await` 带来的状态交错可能性属于严重错误。
-4. **严禁把同步 `fs` 当成异步。** 本仓库 `src/store/` 大量刻意使用 `fs.readFileSync` / `fs.writeFileSync` / `fs.appendFileSync` 以保证单事件循环 tick 内读-改-写不交错，必须如实说明这一设计取舍。
-5. **不得为填模板而编造。** 不存在就写 `N/A`，不确定就标 `【推断】` 或 `【未验证】`。
+1. **严禁伪造 Java 映射。** 无直接对应时写「无直接对应」并说明差异。
+2. **路径不可悬空。** 首次出现必带 `path:line`。
+3. **严禁忽略让出点。** 漏掉 `await` 带来的交错属于严重错误。
+4. **严禁省略前提。** 依赖单进程语义的结论必须带 0.1 的前提声明。
+5. **严禁把注释当证明。** 见第 1 节第 4 条。
+6. **不得为填模板编造。** 不存在写 `N/A`，不确定标 `【推断】` / `【未验证】`。
 
 ---
 
 ## 8. 输出前自检清单
 
-- [ ] 每个本仓库函数、常量、类型、文件都在本次会话中 `grep` / `read` 过，且首次出现带 `path:line`。
-- [ ] 函数签名与类型定义逐字对照过源码。
-- [ ] 已包含第 2.3 节的标准四行对比表（编译期 vs. 运行时、内存生命周期、调度边界、异常与取消）。
-- [ ] 若涉及并发/锁，已标出同步原子段、`await` 挂起点、`globalThis` 挂载原因及 `finally` 释放逻辑。
-- [ ] 若涉及模块依赖/DI，已核对 `eslint.config.mjs` 的具体 Zone。
-- [ ] 已列出 Java 惯性反模式及 `tests/` 中的真实测试佐证 `path:line`。
-- [ ] 推断和未读到的内容已标 `【推断】` / `【未验证】`。
+- [ ] 已记录 HEAD commit；所有本仓库标识符本次会话中 grep/read 过，首次出现带 `path:line`。
+- [ ] 签名与对象字面量逐字对照源码（包括包装函数）。
+- [ ] 已包含第 2.4 节四行对比表。
+- [ ] 并发分析：已标出同步段、每个让出点、`globalThis` 挂载原因、`finally` 释放逻辑，并推演过中止路径。
+- [ ] 依赖单进程语义的结论已写前提声明。
+- [ ] 模块依赖分析：已核对 6.2 的 zone 及 `except` 路径语义。
+- [ ] 已列 Java 惯性反模式；测试佐证带 `path:line`，或明确写「无测试覆盖」。
+- [ ] 仅由注释支撑的结论已标明来源或 `【未验证】`。
 
 ---
 
-## 9. 示范案例：后台 LLM 并发控制（异步信号量 + FIFO Promise 互斥锁）与无容器 DI
+## 9. 示范案例：后台 LLM 并发控制（异步信号量 + Promise 链互斥锁）与无容器 DI
 
-> 以下行号于 2026-11-09 对照代码核对。使用本案例前**必须重新核对**；代码与本文不一致时以代码为准。
+> 行号基于 commit `8b235af`（2026-11-06）。按第 1 节第 0 条复核后使用；代码与本文不一致时以代码为准。
+> 前提：单进程部署（0.1）。
 
-**总览**：拆解本仓库知识图谱抽取流水线如何不依赖 JVM 多线程锁与 Spring IoC 容器，在 Node.js 单线程事件循环上用 `withBgLlmSlot`（3 许可异步信号量）、`withAuditLock`（FIFO Promise 链互斥锁）与函数式闭包注入实现并发控流与临界区保护（映射域：**M3 并发模型 + M2 依赖注入**）。
+**总览**：抽取流水线在单线程事件循环上用 `withBgLlmSlot`（3 许可信号量）限制后台 LLM 并发，用 `withAuditLock`（Promise 链 FIFO 锁）串行化「审计 + 合并」临界区，并通过工厂参数获得存储端口（映射域：**M3 + M2**）。
 
 ### 维度一：源码定位与签名原貌
 
-1. **进程级 3 许可异步信号量**（位于 `src/agent/subagents/bg-llm-semaphore.ts`，智能体子任务层）：
-   - 常量与状态类型（`src/agent/subagents/bg-llm-semaphore.ts:30-35`）：
-     ```ts
-     const PERMIT_COUNT = 3;
+1. **进程级信号量**（`src/agent/subagents/bg-llm-semaphore.ts`，agent 层）：
+   ```ts
+   const PERMIT_COUNT = 3;                       // :30
 
-     export interface LlmSlots {
-     	active: number;
-     	queue: { resolve: () => void; dead: boolean }[];
-     }
-     ```
-   - 信号量获取与执行函数签名（`src/agent/subagents/bg-llm-semaphore.ts:52-55`）：
-     ```ts
-     export async function withBgLlmSlot<T>(
-     	signal: AbortSignal | undefined,
-     	critical: () => Promise<T>,
-     ): Promise<T>
-     ```
-2. **审计 + 合并全局 FIFO 互斥锁**（位于 `src/agent/subagents/extraction.ts`，定义在工厂函数 `createExtractionPipeline(deps: ExtractionDeps)`（`src/agent/subagents/extraction.ts:803`）闭包内）：
-   - 全局锁类型声明（`src/agent/subagents/extraction.ts:678`）：
-     ```ts
-     __lhAuditLock?: { tail: Promise<void> };
-     ```
-   - 互斥包装函数签名（`src/agent/subagents/extraction.ts:896`）：
-     ```ts
-     async function withAuditLock<T>(jobKey: string, kind: "chat" | "notes", label: string | undefined, critical: () => Promise<T>): Promise<T>
-     ```
-3. **存储组合根与端口契约**（位于 `src/core/ports.ts` 与 `src/server/stores.ts`）：
-   - 端口定义：`export interface ChatStore`（`src/core/ports.ts:34`）、`export interface GraphStore`（`src/core/ports.ts:79`）。
-   - 唯一存储组合根：`export const stores = { chatStore, graphStore, sourceOrganizationStore, jobStore, settingsStore }`（`src/server/stores.ts:17-23`）。
+   export interface LlmSlots {                   // :32-35
+   	active: number;
+   	queue: { resolve: () => void; dead: boolean }[];
+   }
 
-### 维度二：Java Web 对标参照（同构点 vs. 异构点）
+   export function bgLlmSlots(): LlmSlots {      // :44-47
+   	const g = globalThis as typeof globalThis & LhLlmSemaphoreGlobal;
+   	return (g.__lhLlmSlots ??= { active: 0, queue: [] });
+   }
 
-- **对应 Java 概念**：
-  - `withBgLlmSlot` 对应 `java.util.concurrent.Semaphore(3, true)`（公平模式信号量）。
-  - `withAuditLock` 对应 `java.util.concurrent.locks.ReentrantLock(true)`（公平互斥锁，注意本实现**不可重入**）。
-  - `createExtractionPipeline(deps)` + `stores.ts` 对应 Spring `@Service` 构造器注入 `@Repository` 接口 + `@Configuration` 装配类。
+   export async function withBgLlmSlot<T>(       // :52-55
+   	signal: AbortSignal | undefined,
+   	critical: () => Promise<T>,
+   ): Promise<T>
+   ```
+2. **审计互斥锁**（定义在 `createExtractionPipeline()` 闭包内，`src/agent/subagents/extraction.ts:803`）：
+   ```ts
+   __lhAuditLock?: { tail: Promise<void> };      // :678（LhExtractionGlobal 字段）
 
-| 对比维度 | Java Web 机制（参照系） | 本仓库 TS/Node/Next.js 实现（带 `path:line`） | 核心差异与迁移陷阱 |
+   async function withAuditLock<T>(jobKey: string, kind: "chat" | "notes", label: string | undefined, critical: () => Promise<T>): Promise<T>   // :896
+   ```
+3. **端口与组合根**：
+   - `export interface ChatStore`（`src/core/ports.ts:33`）、`export interface GraphStore`（`src/core/ports.ts:76`）。
+   - `export interface GraphDeps { chatStore: ChatStore; graphStore: GraphStore; }`（`src/core/graph.ts:74-77`）。
+   - `export interface ExtractionPipelineDeps extends GraphDeps, ExtractionModels`（`src/agent/subagents/extraction.ts:743`）；工厂签名 `export function createExtractionPipeline(deps: ExtractionPipelineDeps): ExtractionPipeline`（`:803`），首行 `const { chatStore, graphStore } = deps;`（`:804`）。
+   - 组合根（`src/server/stores.ts:18-34`）：每个适配器都经 `traceObject(scope, label, target, options)`（`src/core/logger.ts:179`，注释称其为「transparent ES Proxy」）包装：
+     ```ts
+     export const stores = {
+     	chatStore: traceObject("STORE", "chatStore", chatStore, { exclude: new Set(["getChat", "listChats"]) }),
+     	graphStore: traceObject("STORE", "graphStore", graphStore, { exclude: new Set([/* read* 方法 */]) }),
+     	sourceOrganizationStore: traceObject(/* … */),
+     	jobStore: traceObject(/* … */),
+     	settingsStore: traceObject(/* … */),
+     };
+     ```
+   - 装配点：`export const extraction = createExtractionPipeline({ ...stores, engineFor: …, providerKeyMissing: … })`（`src/server/chat-handler.ts:121-134`）。
+
+### 维度二：Java 对标
+
+- `withBgLlmSlot` ≈ `new Semaphore(3, true)`（公平）。差异：许可释放时直接移交给队首等待者，不经过「归还再争抢」。
+- `withAuditLock` ≈ `new ReentrantLock(true)`。差异：**不可重入**；`release` 可以由任意回调调用，不要求同一「线程」。
+- `stores` + `traceObject` ≈ `@Configuration` 装配 + Spring AOP 代理（日志切面）；`createExtractionPipeline(deps)` ≈ 构造器注入。差异：没有容器、没有按类型自动装配，装配是一次普通函数调用。
+
+| 对比维度 | Java Web 机制 | 本仓库实现 | 核心差异与迁移陷阱 |
 |---|---|---|---|
-| **编译期 vs. 运行时存在性** | `ChatStore`/`GraphStore` 编译为字节码 `interface`，Spring 启动时通过反射/CGLIB 扫描装入容器 | `ChatStore`/`GraphStore`（`src/core/ports.ts:34,79`）在编译为 JS 后**完全擦除**；`stores`（`src/server/stores.ts:17`）只是普通对象字面量，靠结构化类型匹配（Structural Typing）传入 `createExtractionPipeline` | TS 中无法写 `if (obj instanceof GraphStore)`；也不存在运行期按类型自动注入的容器 |
-| **内存作用域与生命周期** | 锁与信号量作为字段存放在 Spring Singleton Bean 实例中，随 `ApplicationContext` 存活 | 状态挂在 `globalThis.__lhLlmSlots`（`bg-llm-semaphore.ts:46`）与 `globalThis.__lhAuditLock`（`extraction.ts:899`），由惰性初始化函数 `??=` 创建 | Next.js `next dev` 会把每个 API 路由编译为独立模块实例（见注释 `bg-llm-semaphore.ts:41-43`）；若像 Java `private static final` 那样写成模块顶层 `const`，不同路由会拿到各自的信号量副本导致限流失效 |
-| **调度与并发交错边界** | 多 OS 线程抢占执行，`active++` 或队列入队必须用 CAS / AQS 锁保护，否则发生竞态 | 单线程事件循环：`if (slots.active >= PERMIT_COUNT)` 到 `slots.queue.push(ticket)`（`bg-llm-semaphore.ts:58-62`）之间**无 `await`**，天然原子执行；唯有 `await new Promise(...)`（`:60`）和 `await critical()`（`:76`）让出控制权 | 同步代码块内绝对不会发生多线程穿插；但一旦跨过 `await`，内存中其他变量可能已被别的请求修改 |
-| **异常与取消传播** | 阻塞在 `semaphore.acquireInterruptibly()` 的线程收到 `Thread.interrupt()` 抛出 `InterruptedException`，AQS 自动清理等待节点 | 传入 `AbortSignal`：排队期间 abort 触发监听器将 `ticket.dead = true` 并 `reject(AbortError)`（`bg-llm-semaphore.ts:64-69`）；`withAuditLock` 则用 `await Promise.race([prev, aborted])`（`extraction.ts:916`）并在唤醒瞬间调 `signal?.throwIfAborted()`（`:917`） | JS Promise 一旦创建无法从外部强制销毁其链条，必须靠显式标记 `ticket.dead = true` 让释放方跳过死票据（`:87`），或让被取消的节点在 `finally` 中照常 `release()`（`extraction.ts:921`）以免后续排队者永久挂起 |
+| **编译期 vs. 运行时存在性** | `ChatStore` 编译为字节码接口，容器按类型反射注入 | `ChatStore` / `GraphStore`（`src/core/ports.ts:33,76`）编译后擦除；`stores` 是普通对象字面量，按结构类型满足 `GraphDeps` | 不能 `instanceof GraphStore`；注入错对象只在编译期由结构类型检查发现，运行期无容器兜底 |
+| **内存作用域与生命周期** | 锁作为 Singleton Bean 字段，随 `ApplicationContext` 存活 | `globalThis.__lhLlmSlots`（`bg-llm-semaphore.ts:46`）、`globalThis.__lhAuditLock`（`extraction.ts:899`），`??=` 惰性创建，进程重启清空 | 注释（`bg-llm-semaphore.ts:41-43`）称 Next dev 为每个路由入口编译独立模块实例；`node_modules/next/dist/docs/` 中未找到对应说明 →【未验证】。无论是否如此，dev 热重载也会重置模块顶层状态 |
+| **调度与交错边界** | 多线程抢占，`active++` 需 AQS/CAS | `if (slots.active >= PERMIT_COUNT)`（`:58`）到 `slots.queue.push(ticket)`（`:62`）是同步段；让出点只有 `await new Promise(...)`（`:60`）与 `await critical()`（`:76`） | 同步段不会被打断；跨过让出点后其他请求可能已修改任意共享状态 |
+| **异常与取消传播** | `acquireInterruptibly()` 收到中断抛 `InterruptedException`，AQS 清理节点 | 排队中 abort：`die()` 置 `ticket.dead = true` 并 reject `AbortError`（`:64-69`），释放方跳过死票据（`:87`）；锁侧用 `Promise.race([prev, aborted])`（`extraction.ts:916`）+ `signal?.throwIfAborted()`（`:917`） | Promise 无法从外部取消，只能靠标记位与 `finally`；锁侧的中止路径会破坏互斥（见维度三第 3 点） |
 
-### 维度三：物理运行机制拆解
+### 维度三：物理运行机制
 
 ```mermaid
 sequenceDiagram
-    participant C1 as 协程 1 (Batch 1)
-    participant C2 as 协程 2 (Batch 4, 需排队)
+    participant A as runJob A（持有许可）
+    participant B as runJob B（排队）
     participant Pool as globalThis.__lhLlmSlots
-    participant Lock as globalThis.__lhAuditLock
-
-    Note over C1,Pool: 1. 信号量获取（同步原子段，无 await）
-    C1->>Pool: bgLlmSlots() -> active < 3 (freshTake = true)
-    C1->>Pool: slots.active++ (bg-llm-semaphore.ts:74)
-    C1->>C1: await critical() [挂起点：发起 LLM 抽取请求]
-
-    Note over C2,Pool: 2. 满额排队与许可直接移交（Handoff）
-    C2->>Pool: active >= 3 (freshTake = false)
-    C2->>Pool: slots.queue.push(ticket) (:62)，随后 await Promise 挂起
-    C1->>Pool: finally 块 (:77-91)：shift() 取出 C2 的非 dead 票据
-    C1->>C2: next.resolve() (:88) —— 注意：active 不减也不加！
-    C2->>C2: 从 await 恢复，因 freshTake=false 不再 active++，直接继承许可
-
-    Note over C1,Lock: 3. Promise 链 FIFO 互斥锁（withAuditLock）
-    C1->>Lock: prev = lock.tail; lock.tail = new Promise(r => release = r) (extraction.ts:900-902)
-    C1->>C1: await Promise.race([prev, aborted]) (:916) [挂起点]
-    C1->>C1: signal?.throwIfAborted() (:917) -> await critical() (:918)
-    C1->>Lock: finally: release() (:921) 唤醒链上下一个尾节点
+    Note over A,Pool: 同步段：无让出点
+    A->>Pool: active < 3 → freshTake=true，active++（:74）
+    A->>A: await critical()（:76）让出点
+    B->>Pool: active >= 3 → freshTake=false（:59）
+    B->>Pool: queue.push(ticket)（:62），await 挂起（:60）
+    A->>Pool: finally：queue.shift() 得到 B（:82）
+    A->>B: next.resolve()（:88），active 不变
+    B->>B: 恢复；freshTake=false，不 active++，继承许可
 ```
 
-1. **信号量为什么区分 `freshTake` 与直接移交（Handoff）**：
-   - 在 `withBgLlmSlot`（`src/agent/subagents/bg-llm-semaphore.ts:57-91`）中，当 `slots.active < PERMIT_COUNT` 时，`freshTake = true`，同步执行 `slots.active++`（`:74`）。
-   - 当 `slots.active >= PERMIT_COUNT` 时，`freshTake = false`（`:59`），协程挂起在 `await new Promise(...)`（`:60`）。
-   - 当前持有者在 `finally`（`:77-91`）退出时，从 `slots.queue.shift()` 取出排队的 `next`：若存在有效等待者，直接调用 `next.resolve()`（`:88`）而**不执行 `slots.active--`**；被唤醒的协程因为 `freshTake === false` 也**不执行 `slots.active++`**。只有队列为空（或全为 `dead`）时才执行 `slots.active--`（`:84`）。这消除了“释放者减 1、唤醒微任务尚未执行前被新来的同步调用抢走并再次累加”的计数错乱风险（见注释 `:16-20`）。
-2. **`withAuditLock` 如何用 4 行代码实现 FIFO 互斥锁**：
-   - 在 `withAuditLock`（`src/agent/subagents/extraction.ts:898-902`）中，进入 `await` 之前的同步段完成了「读取旧队尾 `prev = lock.tail` + 将 `lock.tail` 替换为自己控制的 `new Promise`」的原子指针交换（类似 Java AQS 中 `tail.getAndSet(node)`，但因为单线程同步执行，无需 CAS 指令）。
-   - 即使等待者在排队期间因 `aborted` 分支提前 `reject` 跳入 `finally`，它的 `release()`（`:921`）依然会被调用，从而将接力棒传给链上的后继者，保证锁链永不断裂（注释 `:893-895`）。
-3. **依赖如何遵循模块红线注入**：
-   - 按 `eslint.config.mjs:63-68`（Zone 4），`src/agent/**` 严禁直接 `import` `src/server` 或 `src/store`。
-   - 因此 `src/agent/subagents/extraction.ts` 只从 `../../core/ports.ts` 导入纯接口 `ChatStore` 与 `GraphStore`，并通过工厂函数 `createExtractionPipeline(deps: ExtractionDeps)`（`extraction.ts:803`）的参数闭包捕获存储实例；真正的组装发生在 `src/server/` 层（将 `src/server/stores.ts:17` 的 `stores` 传入）。
+1. **信号量的许可移交**（`bg-llm-semaphore.ts:57-91`）：
+   - 空闲时 `freshTake = true`，同步执行 `slots.active++`（`:74`）。
+   - 满额时排队；被唤醒者因 `freshTake === false` 不再自增。释放者在 `finally` 中只有队列为空（或剩下的全是 dead 票据）时才 `slots.active--`（`:84`），否则 `next.resolve()`（`:88`）且计数不变。
+   - 作用：避免「释放者减 1 后、被唤醒者恢复前，新来的同步调用抢占许可」导致的计数错乱（注释 `:16-20`）。
+   - 中止：排队者 abort 时在进入 `try` 之前抛出，因此不会执行 `active++`，也不会进入释放它的 `finally`；它的票据留在队列里，由下一次释放跳过。计数守恒成立。
+2. **Promise 链锁的获取**（`extraction.ts:898-902`）：同步段内完成「读旧队尾 `prev = lock.tail`」与「`lock.tail` 换成自己的新 Promise」，相当于 AQS 的 `tail.getAndSet(node)`，但单线程下不需要 CAS。
+3. **已知缺陷：排队者中止会破坏互斥** 【推断】
+   - 源码在 `finally` 中无条件 `release()`（`:919-922`），注释（`:893-895`）只保证「后继者不会永久挂起」，没有保证互斥。
+   - 反例：A 持锁执行 `critical()`；B 排队（`prev = TA`，`tail = TB`）；C 排队（`prev = TB`，`tail = TC`）。B 被中止 → `Promise.race` 以 `AbortError` 结束 → B 的 `finally` 立即 resolve `TB` → C 的 `await Promise.race([TB, …])` 通过，C 进入 `critical()`，此时 A 仍在临界区内。
+   - 后果：两个「审计 + 合并」同时运行，正是 `extraction.ts:887-889` 注释要防止的重复建节点。
+   - 修复方向：中止者在 `finally` 中先等待 `prev` 落定，再 `release()`。
+   - 测试：`tests/` 中 grep `withAuditLock` / `withBgLlmSlot` 无结果 → 无测试覆盖。
+4. **依赖如何遵守红线**：Zone 4（`eslint.config.mjs:63-68`）禁止 `src/agent` 导入 `src/server` / `src/store`。`extraction.ts` 只做类型导入 `import type { GraphStore } from "../../core/ports.ts"`（`:27`），其余通过 `ExtractionPipelineDeps extends GraphDeps` 获得；具体实例在 `src/server/chat-handler.ts:121` 以 `...stores` 传入。
 
-### 维度四：Java 惯性反模式与防坑守则
+### 维度四：Java 惯性反模式
 
-1. **反模式 1：在 `src/agent/` 下直接导入 `src/store/graph.ts` 单例**
-   - **后果**：触发 `eslint.config.mjs:63-68` 的 `import/no-restricted-paths` 错误（*"The agent layer receives its dependencies (storage ports via factories/closures) — it never imports the server layer or store adapters"*），`npm run lint` 与 CI 直接失败。
-2. **反模式 2：将信号量写成模块级静态变量 `const slots: LlmSlots = { active: 0, queue: [] }`**
-   - **后果**：在 Next.js 开发服务器中，`/api/chat` 路由与 `/api/graph/status` 路由各自加载一份模块实例，导致并发上限变成 `3 × 路由实例数`，且状态监控路由读取到的永远是空队列。必须通过 `globalThis` + `??=`（`bg-llm-semaphore.ts:45-46`）挂载。
-3. **反模式 3：像 Java `ReentrantLock` 一样在 `withAuditLock` 的 `critical()` 回调内部再次调用 `withAuditLock`**
-   - **后果**：**永久死锁**。`lock.tail` 是单纯的 FIFO Promise 链，没有记录 `ownerThread`（Node 单线程中所有协程共享同一线程，也没有默认绑定 `AsyncLocalStorage` 锁重入计数）。外层 `withAuditLock` 等待内层完成才触发 `release()`，而内层又排在外层未释放的 `prev` 后面。
+1. **在 `src/agent/` 直接导入 `src/store/graph.ts` 单例**：触发 Zone 4，消息原文为 `The agent layer receives its dependencies (storage ports via factories/closures) — it never imports the server layer or store adapters (architecture: docs/architecture.md).`（`eslint.config.mjs:66-67`），`npm run lint` 失败。
+2. **把信号量写成模块顶层 `const slots = { active: 0, queue: [] }`**：dev 热重载重新求值模块时计数被重置，正在排队的票据被遗弃【推断】；若注释描述的「按路由独立模块实例」成立，还会出现每个实例各有 3 个许可【推断】。
+3. **在 `withAuditLock` 的 `critical()` 内再次调用 `withAuditLock`**：永久挂起。内层的 `prev` 是外层的 tail，外层要等 `critical()`（包括内层）返回后才 `release()`，形成环形等待。JS 没有线程身份，要实现可重入必须自己用 `AsyncLocalStorage` 记录持有者。
 
-### 维度五：确定性测试验证对照（`node:test` vs. JUnit/Mockito）
+### 维度五：测试验证对照
 
-- 在 Java Spring 中，测试抽取流水线通常需要 `@SpringBootTest` 或 `@ExtendWith(MockitoExtension.class)` + `@Mock ChatStore`。
-- 在本仓库 `tests/extraction.test.ts:440` 中，直接调用工厂函数传入内存构造的假存储与假模型函数，无需任何容器或字节码代理：
+- Spring 中通常用 `@SpringBootTest` 或 `@ExtendWith(MockitoExtension.class)` + `@Mock ChatStore`。
+- 本仓库直接调用工厂并传入内存假对象（`tests/extraction.test.ts:440`）：
   ```ts
   const pipeline = createExtractionPipeline({ chatStore, graphStore: ledgers, extractor, auditor: submitModel("submit_review", verdict) });
   ```
-- 针对未配置模型或缺失 API Key 的拒绝门控测试（`tests/extraction.test.ts:2517-2518`），直接构造不同 `deps` 组合并用原生 `assert.rejects(..., ModelsNotConfiguredError)` 断言，毫秒级完成且完全脱离真实网络与磁盘配置。
+- 拒绝门控（`tests/extraction.test.ts:2517-2518`）：不传模型 → `assert.rejects(..., ModelsNotConfiguredError)`；传入 `providerKeyMissing` → `assert.rejects(..., ProviderKeyMissingError)`。
+- 并发原语本身：N/A — 无测试覆盖（grep 关键字：`withBgLlmSlot`、`bgLlmSlots`、`withAuditLock`、`__lhAuditLock`）。
